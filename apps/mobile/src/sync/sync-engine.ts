@@ -30,6 +30,45 @@ function safeParsePayload(raw: string): any {
 }
 
 /**
+ * Dead-letter register for game events that can never be pushed.
+ *
+ * A payload that fails JSON.parse fails deterministically — retrying cannot
+ * help. Previously the sync cycle threw on these so WatermelonDB would leave
+ * them unsynced, but that made a single corrupt row a poison pill: every
+ * cycle re-read it, threw, and retried forever. Worse, failing the cycle also
+ * kept every *healthy* event in the same batch unsynced, so the queue could
+ * never drain and the scorer got an endless "Sync failed" toast.
+ *
+ * Instead we record the offenders here and let the cycle succeed. The rows
+ * stay in the local database for inspection — nothing is deleted — they are
+ * simply no longer retried. Read with `getQuarantinedEventIds()`.
+ */
+const QUARANTINED_EVENTS_KEY = 'sync.quarantinedEventIds';
+const QUARANTINE_CAP = 200;
+
+export async function getQuarantinedEventIds(): Promise<string[]> {
+  try {
+    const raw = await database.localStorage.get<string>(QUARANTINED_EVENTS_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function quarantineEventIds(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  try {
+    const existing = await getQuarantinedEventIds();
+    // Keep the most recent offenders; this is a diagnostic register, not a
+    // queue, so an unbounded list would grow forever on a wedged device.
+    const merged = [...new Set([...existing, ...ids])].slice(-QUARANTINE_CAP);
+    await database.localStorage.set(QUARANTINED_EVENTS_KEY, JSON.stringify(merged));
+  } catch (err) {
+    console.warn('sync: could not persist quarantined event ids', err);
+  }
+}
+
+/**
  * After a sequence-number collision (pg error 23505 on the game_events
  * unique(game_id, sequence_number) constraint), shift the local WDB
  * records' sequence numbers so they start above the server's current
@@ -245,41 +284,53 @@ export async function syncWithSupabase(): Promise<void> {
         );
       }
 
+      // Every pulled row goes in `updated`, never `created`.
+      //
+      // The pull is a timestamp window (`gte(updated_at, since)`) — it cannot
+      // tell a row born since the last sync from one merely edited since, and
+      // it re-delivers rows the device itself just pushed (their server-set
+      // synced_at lands inside the window). Reporting those as `created` makes
+      // WatermelonDB log "Server wants client to create record X, but it
+      // already exists locally… could be a serious bug" for every echoed row,
+      // burying real diagnostics. `updated` is the documented shape for a
+      // backend that can't distinguish the two: WDB updates the row when it
+      // exists and creates it when it doesn't. `sendCreatedAsUpdated` below
+      // tells it we mean this, silencing the mirror-image warning.
       return {
         changes: {
           games: {
-            created: (gamesResult.data ?? []).map(mapGame),
-            updated: [],
+            created: [],
+            updated: (gamesResult.data ?? []).map(mapGame),
             deleted: [],
           },
           game_events: {
-            created: (eventsResult.data ?? []).map(mapGameEvent),
-            updated: [],
+            created: [],
+            updated: (eventsResult.data ?? []).map(mapGameEvent),
             deleted: [],
           },
           players: {
-            created: [...playerRowsById.values()].map(mapPlayer),
-            updated: [],
+            created: [],
+            updated: [...playerRowsById.values()].map(mapPlayer),
             deleted: [],
           },
           channels: {
-            created: (channelsResult.data ?? []).map(mapChannel),
-            updated: [],
+            created: [],
+            updated: (channelsResult.data ?? []).map(mapChannel),
             deleted: [],
           },
           messages: {
-            created: (messagesResult.data ?? []).map(mapMessage),
-            updated: [],
+            created: [],
+            updated: (messagesResult.data ?? []).map(mapMessage),
             deleted: [],
           },
           game_lineups: {
-            created: pulledLineups.map(mapGameLineup),
-            updated: [],
+            created: [],
+            updated: pulledLineups.map(mapGameLineup),
             deleted: deletedLineupIds,
           },
           league_players: {
-            created: (leaguePlayersResult.data ?? []).map(mapLeaguePlayer),
-            updated: [],
+            created: [],
+            updated: (leaguePlayersResult.data ?? []).map(mapLeaguePlayer),
             deleted: [],
           },
         },
@@ -313,15 +364,19 @@ export async function syncWithSupabase(): Promise<void> {
       const createdEvents = tableChanges.game_events?.created ?? [];
       if (createdEvents.length > 0) {
         // Skip events whose payload can't be parsed rather than aborting the
-        // whole sync. Offenders stay in WatermelonDB with synced_at=null and
-        // are surfaced by SyncProvider's pendingEventsCount so the scorer
-        // knows something is stuck.
+        // whole sync. Offenders are dead-lettered below — their rows remain
+        // in WatermelonDB for inspection but are not retried, so one corrupt
+        // payload can't wedge the queue for every other event.
         const skippedIds: string[] = [];
         const pushablePayloads = createdEvents
           .map((e) => {
             const payload = safeParsePayload(e.payload as string);
             if (payload === null) {
-              skippedIds.push(e.remote_id as string);
+              // A row corrupt enough to have an unparseable payload may also
+              // be missing its remote_id, so fall back to the WDB id — an
+              // empty string in the register would be useless for tracking
+              // the offender down later.
+              skippedIds.push((e.remote_id as string) || `wdb:${e.id as string}`);
               return null;
             }
             return {
@@ -363,15 +418,17 @@ export async function syncWithSupabase(): Promise<void> {
           eventsPushed = true;
         }
 
-        // If any rows were skipped due to unparseable payloads, fail the
-        // sync cycle AFTER the successful upsert so WatermelonDB treats
-        // the cycle as incomplete and leaves those records unsynced.
-        // Otherwise WDB would mark the entire createdEvents batch as
-        // synced (including the skipped ones), silently dropping them.
+        // Rows with unparseable payloads are dead-lettered, not retried.
+        // JSON.parse fails deterministically, so throwing here to keep them
+        // unsynced only produced an infinite retry loop that also blocked
+        // every healthy event in the batch from ever settling. Record them
+        // and let the cycle succeed; the local rows are untouched and can be
+        // inspected via getQuarantinedEventIds().
         if (skippedIds.length > 0) {
-          throw new Error(
-            `sync: ${skippedIds.length} event(s) skipped due to unparseable payloads; ` +
-              `records remain unsynced: ${skippedIds.slice(0, 3).join(', ')}${skippedIds.length > 3 ? '…' : ''}`,
+          await quarantineEventIds(skippedIds);
+          console.warn(
+            `sync: dead-lettered ${skippedIds.length} event(s) with unparseable payloads; ` +
+              `they will not be retried: ${skippedIds.slice(0, 3).join(', ')}${skippedIds.length > 3 ? '…' : ''}`,
           );
         }
       }
@@ -486,7 +543,9 @@ export async function syncWithSupabase(): Promise<void> {
       }
     },
 
-    sendCreatedAsUpdated: false,
+    // Our pull is a timestamp window and cannot separate created from
+    // updated, so it reports everything as `updated` (see pullChanges).
+    sendCreatedAsUpdated: true,
     migrationsEnabledAtVersion: 1,
   });
   syncOk = true;

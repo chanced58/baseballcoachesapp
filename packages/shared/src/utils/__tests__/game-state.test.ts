@@ -793,3 +793,55 @@ describe('deriveGameState — HIT_BY_PITCH pair (regression guard)', () => {
     expect(state.completedTopHalfPAs).toBe(4);
   });
 });
+
+describe('deriveGameState — anonymous opponent batters', () => {
+  beforeEach(resetSeq);
+
+  // A scorer keeping their own team's book has no opponent roster, so events
+  // recorded during the opponent's half carry a pitcher but no batter of any
+  // kind. Those runners still have to occupy bases and score, otherwise a
+  // string of opponent hits leaves the scoreboard at 0.
+  it('places a batter-less hit on base so later hits drive them in', () => {
+    const events: GameEvent[] = [
+      e(EventType.GAME_START, { homeLineupPitcherId: 'home-p' }),
+      // Opponent doubles twice, then homers — no batter id on any of them.
+      e(EventType.HIT, { hitType: HitType.DOUBLE, pitcherId: 'home-p' }),
+      e(EventType.HIT, { hitType: HitType.DOUBLE, pitcherId: 'home-p' }),
+      e(EventType.HIT, { hitType: HitType.HOME_RUN, pitcherId: 'home-p' }),
+    ];
+    const state = deriveGameState(GAME, events, HOME_TEAM);
+
+    // Double, then a double scoring that runner, then a 2-run homer = 3.
+    expect(state.awayScore).toBe(3);
+    expect(state.runnersOnBase).toEqual({ first: null, second: null, third: null });
+  });
+
+  it('keeps anonymous runners distinct rather than collapsing them onto one base', () => {
+    const events: GameEvent[] = [
+      e(EventType.GAME_START, { homeLineupPitcherId: 'home-p' }),
+      e(EventType.WALK, { pitcherId: 'home-p' }),
+      e(EventType.WALK, { pitcherId: 'home-p' }),
+    ];
+    const state = deriveGameState(GAME, events, HOME_TEAM);
+
+    expect(state.runnersOnBase.first).not.toBeNull();
+    expect(state.runnersOnBase.second).not.toBeNull();
+    expect(state.runnersOnBase.first).not.toBe(state.runnersOnBase.second);
+    expect(state.awayScore).toBe(0);
+  });
+
+  it('does not credit an anonymous runner to a named batter', () => {
+    const events: GameEvent[] = [
+      e(EventType.GAME_START, { homeLineupPitcherId: 'home-p' }),
+      e(EventType.HIT, { hitType: HitType.SINGLE, pitcherId: 'home-p' }),
+    ];
+    const state = deriveGameState(GAME, events, HOME_TEAM);
+    const batting = deriveBattingStats(events, [
+      { id: 'home-p', firstName: 'Home', lastName: 'Pitcher' },
+    ]);
+
+    expect(state.runnersOnBase.first).not.toBeNull();
+    // The stand-in identifies a runner only; it must never appear as a batter.
+    expect(batting.has(state.runnersOnBase.first!)).toBe(false);
+  });
+});

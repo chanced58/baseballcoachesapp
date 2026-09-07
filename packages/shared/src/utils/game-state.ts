@@ -162,7 +162,7 @@ export function deriveGameState(
         // straight to a walk/HBP/CI (or if events arrive out of order
         // via corrections).
         const p = event.payload as { batterId?: string; opponentBatterId?: string };
-        const batterId = p.batterId ?? p.opponentBatterId ?? state.currentBatterId;
+        const batterId = baserunnerIdentity(p, state.currentBatterId, event.id);
         const walkBasesLoaded = !!(
           state.runnersOnBase.first &&
           state.runnersOnBase.second &&
@@ -183,7 +183,7 @@ export function deriveGameState(
         // currentBatterId only updates on PITCH_THROWN, so a HIT recorded
         // without a preceding pitch (quick entry) would otherwise strand the
         // stale previous batter's id on the bag. Mirrors the WALK handler.
-        const hitBatterId = p.batterId ?? p.opponentBatterId ?? state.currentBatterId;
+        const hitBatterId = baserunnerIdentity(p, state.currentBatterId, event.id);
         // Guard runner advancement / run scoring when the inning is already
         // over (e.g. a fielder's choice whose preceding BASERUNNER_OUT was
         // the 3rd out). The batter still completes a PA + AB, so incrementPA
@@ -241,7 +241,7 @@ export function deriveGameState(
         // on base (same logic as a walk) and place batter on first.
         // If bases were loaded, the runner on third is forced home.
         const p = event.payload as { batterId?: string; opponentBatterId?: string };
-        const errorBatterId = p.batterId ?? p.opponentBatterId ?? state.currentBatterId;
+        const errorBatterId = baserunnerIdentity(p, state.currentBatterId, event.id);
         const errorBasesLoaded = !!(
           state.runnersOnBase.first &&
           state.runnersOnBase.second &&
@@ -270,7 +270,7 @@ export function deriveGameState(
           state.outs++;
         } else {
           // Batter reaches first — force-advance runners
-          const d3kBatterId = p.batterId ?? p.opponentBatterId ?? state.currentBatterId;
+          const d3kBatterId = baserunnerIdentity(p, state.currentBatterId, event.id);
           const basesLoaded = !!(
             state.runnersOnBase.first &&
             state.runnersOnBase.second &&
@@ -505,6 +505,29 @@ export function deriveGameState(
   }
 
   return state;
+}
+
+/**
+ * Who to put on the bases for this plate appearance.
+ *
+ * Opponent halves frequently have no batter id: a scorer keeping their own
+ * team's book has no opponent roster, and entering the opponent lineup is
+ * optional. Falling through to null meant the batter was never placed on a
+ * base — the runner simply vanished, and every run they would later have
+ * scored was lost, so a string of opponent hits left the score at 0.
+ *
+ * The event id is a stable stand-in: it replays identically, is unique per
+ * plate appearance (so three anonymous runners can be on base at once), and
+ * cannot collide with a real player id. It identifies a runner only — stats
+ * attribution still reads the payload's batter fields, which stay empty, so
+ * nothing is mis-credited to a named player.
+ */
+function baserunnerIdentity(
+  payload: { batterId?: string; opponentBatterId?: string },
+  currentBatterId: string | null,
+  eventId: string,
+): string {
+  return payload.batterId ?? payload.opponentBatterId ?? currentBatterId ?? eventId;
 }
 
 function hitTypeToBases(hitType: string): number {
