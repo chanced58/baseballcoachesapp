@@ -11,7 +11,7 @@ import { appSchema, tableSchema } from '@nozbe/watermelondb';
  * next launch.
  */
 export const schema = appSchema({
-  version: 2,
+  version: 3,
   tables: [
     tableSchema({
       name: 'games',
@@ -20,6 +20,7 @@ export const schema = appSchema({
         { name: 'season_id', type: 'string' },
         { name: 'team_id', type: 'string' },
         { name: 'opponent_name', type: 'string' },
+        { name: 'opponent_team_id', type: 'string', isOptional: true, isIndexed: true },
         { name: 'scheduled_at', type: 'number' },           // Unix ms timestamp
         { name: 'location_type', type: 'string' },
         { name: 'neutral_home_team', type: 'string', isOptional: true },
@@ -116,6 +117,40 @@ export const schema = appSchema({
         { name: 'parent_id', type: 'string', isOptional: true },
         { name: 'is_pinned', type: 'boolean' },
         { name: 'created_at', type: 'number' },
+        { name: 'synced_at', type: 'number', isOptional: true },
+      ],
+    }),
+    // The opposing team's players, keyed by opponent_team_id (games carry
+    // opponent_team_id). Mirrored so the scorer can name opponent batters at
+    // a field with no signal — without these, every opponent plate
+    // appearance is anonymous and their stats are unattributable.
+    tableSchema({
+      name: 'opponent_players',
+      columns: [
+        { name: 'remote_id', type: 'string', isIndexed: true },
+        { name: 'opponent_team_id', type: 'string', isIndexed: true },
+        { name: 'first_name', type: 'string' },
+        { name: 'last_name', type: 'string' },
+        { name: 'jersey_number', type: 'string', isOptional: true },
+        { name: 'primary_position', type: 'string', isOptional: true },
+        { name: 'is_active', type: 'boolean' },
+        { name: 'updated_at', type: 'number' },
+        { name: 'synced_at', type: 'number', isOptional: true },
+      ],
+    }),
+    // The opponent's batting order for one game. Server-side this table has
+    // only created_at — no updated_at — so the sync engine refreshes it per
+    // game rather than by timestamp window (see sync-engine pullChanges).
+    tableSchema({
+      name: 'opponent_game_lineups',
+      columns: [
+        { name: 'remote_id', type: 'string', isIndexed: true },
+        { name: 'game_remote_id', type: 'string', isIndexed: true },
+        { name: 'opponent_player_remote_id', type: 'string', isIndexed: true },
+        { name: 'batting_order', type: 'number', isOptional: true },
+        { name: 'starting_position', type: 'string', isOptional: true },
+        { name: 'is_starter', type: 'boolean' },
+        { name: 'updated_at', type: 'number' },
         { name: 'synced_at', type: 'number', isOptional: true },
       ],
     }),

@@ -4,12 +4,23 @@ import { computeLineupDeletes } from '@baseball/shared';
 import { database } from '../db';
 import type { GameEvent } from '../db/models/GameEvent';
 import type { GameLineup } from '../db/models/GameLineup';
+import type { OpponentGameLineup } from '../db/models/OpponentGameLineup';
 import { getSupabaseClient } from '../lib/supabase';
 import {
   applyServerLineupSnapshot,
   getDirtyLineupState,
   pushLineupsForGame,
 } from './lineup-sync';
+
+/**
+ * The Supabase player_position enum. Positions reach us as plain strings —
+ * from a WatermelonDB text column, or typed by a scorer — so the upserts
+ * below cast rather than pretending the value was validated upstream.
+ */
+type PlayerPosition =
+  | 'pitcher' | 'catcher' | 'first_base' | 'second_base' | 'third_base'
+  | 'shortstop' | 'infield' | 'left_field' | 'center_field' | 'right_field'
+  | 'outfield' | 'designated_hitter' | 'utility';
 
 
 /**
@@ -190,6 +201,11 @@ export async function syncWithSupabase(): Promise<void> {
       const lineupsSince = migratedTables.has('game_lineups') ? epoch : since;
       const leaguePlayersSince = migratedTables.has('league_players') ? epoch : since;
       const playersSince = migratedColumnTables.has('players') ? epoch : since;
+      const oppPlayersSince = migratedTables.has('opponent_players') ? epoch : since;
+      // games gained opponent_team_id in schema v3; backfill it from epoch on
+      // the first sync after that migration or existing rows keep a null
+      // column and the opponent roster stays unreachable.
+      const gamesSince = migratedColumnTables.has('games') ? epoch : since;
 
       const { data: { user } } = await supabase.auth.getUser();
       if (!user?.id) {
@@ -206,9 +222,9 @@ export async function syncWithSupabase(): Promise<void> {
       if (serverTimeResult.error) throw serverTimeResult.error;
       const pullTimestamp = new Date(serverTimeResult.data as string).getTime();
 
-      const [gamesResult, eventsResult, playersResult, leagueIdentitiesResult, channelsResult, messagesResult, lineupsResult, leaguePlayersResult, pulledDirtyState] =
+      const [gamesResult, eventsResult, playersResult, leagueIdentitiesResult, channelsResult, messagesResult, lineupsResult, leaguePlayersResult, oppPlayersResult, pulledDirtyState] =
         await Promise.all([
-          supabase.from('games').select('*').gte('updated_at', since),
+          supabase.from('games').select('*').gte('updated_at', gamesSince),
           supabase.from('game_events').select('*').gte('synced_at', since),
           supabase.from('players').select('*').gte('updated_at', playersSince),
           // PII-free identities of league-registered players (other teams'
@@ -222,13 +238,56 @@ export async function syncWithSupabase(): Promise<void> {
           supabase.from('messages').select('*, user_profiles!sender_id(first_name, last_name)').gte('created_at', since),
           supabase.from('game_lineups').select('*').gte('updated_at', lineupsSince),
           supabase.from('league_players').select('*').gte('registered_at', leaguePlayersSince),
+          supabase.from('opponent_players').select('*').gte('updated_at', oppPlayersSince),
           getDirtyLineupState(database),
         ]);
 
-      const firstError = [gamesResult, eventsResult, playersResult, leagueIdentitiesResult, channelsResult, messagesResult, lineupsResult, leaguePlayersResult]
+      const firstError = [gamesResult, eventsResult, playersResult, leagueIdentitiesResult, channelsResult, messagesResult, lineupsResult, leaguePlayersResult, oppPlayersResult]
         .map((r) => r.error)
         .find((e) => e != null);
       if (firstError) throw firstError;
+
+      // Opponent batting orders. opponent_game_lineups has no updated_at
+      // server-side, so a timestamp window would never re-deliver an edited
+      // row — instead refresh the whole order for the games this cycle
+      // touched, plus any game with local opponent rows so a server-side
+      // deletion still reaches the device. The tables are tiny (a batting
+      // order, not a season), so a full read per touched game is cheap.
+      const oppLineupGameIds = [
+        ...new Set([
+          ...(gamesResult.data ?? []).map((g) => g.id as string),
+          ...(
+            await database
+              .get<OpponentGameLineup>('opponent_game_lineups')
+              .query()
+              .fetch()
+          ).map((r) => r.gameRemoteId),
+        ]),
+      ];
+      let oppLineupRows: Record<string, unknown>[] = [];
+      let deletedOppLineupIds: string[] = [];
+      if (oppLineupGameIds.length > 0) {
+        const oppLineupsResult = await supabase
+          .from('opponent_game_lineups')
+          .select('*')
+          .in('game_id', oppLineupGameIds);
+        if (oppLineupsResult.error) throw oppLineupsResult.error;
+        oppLineupRows = oppLineupsResult.data ?? [];
+
+        // Rows the device holds for a refreshed game that the server no
+        // longer has were deleted elsewhere; Postgres keeps no tombstones,
+        // so diff the id sets. Locally-created rows not yet pushed are
+        // excluded — they are absent server-side because they have not been
+        // sent, not because anyone deleted them.
+        const serverIds = new Set(oppLineupRows.map((r) => r.id as string));
+        const localRows = await database
+          .get<OpponentGameLineup>('opponent_game_lineups')
+          .query(Q.where('game_remote_id', Q.oneOf(oppLineupGameIds)))
+          .fetch();
+        deletedOppLineupIds = localRows
+          .filter((r) => r.syncedAt != null && !serverIds.has(r.id))
+          .map((r) => r.id);
+      }
 
       dirtyLineupState = pulledDirtyState;
 
@@ -332,6 +391,16 @@ export async function syncWithSupabase(): Promise<void> {
             created: [],
             updated: (leaguePlayersResult.data ?? []).map(mapLeaguePlayer),
             deleted: [],
+          },
+          opponent_players: {
+            created: [],
+            updated: (oppPlayersResult.data ?? []).map(mapOpponentPlayer),
+            deleted: [],
+          },
+          opponent_game_lineups: {
+            created: [],
+            updated: oppLineupRows.map(mapOpponentGameLineup),
+            deleted: deletedOppLineupIds,
           },
         },
         timestamp: pullTimestamp,
@@ -495,6 +564,62 @@ export async function syncWithSupabase(): Promise<void> {
           { onConflict: 'league_id,player_id', ignoreDuplicates: true },
         );
         if (error) deferredErrors.push(`league_players upsert: ${error.message}`);
+      }
+
+      // 3b. Opponent players added at the field. RLS lets a coach on the
+      // game's team insert these directly, so there is no server action in
+      // the path and the whole flow works offline. Client UUID becomes the
+      // server PK, like game_events. Upsert without ignoreDuplicates so a
+      // name or jersey corrected after a partial push still merges.
+      const createdOppPlayers = tableChanges.opponent_players?.created ?? [];
+      const updatedOppPlayers = tableChanges.opponent_players?.updated ?? [];
+      const oppPlayerWrites = [...createdOppPlayers, ...updatedOppPlayers];
+      if (oppPlayerWrites.length > 0) {
+        const { error } = await supabase.from('opponent_players').upsert(
+          oppPlayerWrites.map((p) => ({
+            id: p.remote_id as string,
+            opponent_team_id: p.opponent_team_id as string,
+            first_name: p.first_name as string,
+            last_name: p.last_name as string,
+            jersey_number: (p.jersey_number as string | null) || null,
+            primary_position: ((p.primary_position as string | null) || null) as PlayerPosition | null,
+            is_active: (p.is_active as boolean | undefined) ?? true,
+          })),
+          { onConflict: 'id' },
+        );
+        if (error) deferredErrors.push(`opponent_players upsert: ${error.message}`);
+      }
+
+      // 3c. Opponent batting order. Must follow 3b — opponent_player_id is a
+      // foreign key, and a batter added mid-game pushes both rows in the same
+      // cycle. unique(game_id, opponent_player_id) means a re-slotted batter
+      // conflicts on that pair rather than on id, so target it explicitly.
+      const oppLineupWrites = [
+        ...(tableChanges.opponent_game_lineups?.created ?? []),
+        ...(tableChanges.opponent_game_lineups?.updated ?? []),
+      ];
+      if (oppLineupWrites.length > 0) {
+        const { error } = await supabase.from('opponent_game_lineups').upsert(
+          oppLineupWrites.map((l) => ({
+            id: l.remote_id as string,
+            game_id: l.game_remote_id as string,
+            opponent_player_id: l.opponent_player_remote_id as string,
+            batting_order: (l.batting_order as number | null) ?? null,
+            starting_position: ((l.starting_position as string | null) || null) as PlayerPosition | null,
+            is_starter: (l.is_starter as boolean | undefined) ?? true,
+          })),
+          { onConflict: 'game_id,opponent_player_id' },
+        );
+        if (error) deferredErrors.push(`opponent_game_lineups upsert: ${error.message}`);
+      }
+
+      const deletedOppLineups = tableChanges.opponent_game_lineups?.deleted ?? [];
+      if (deletedOppLineups.length > 0) {
+        const { error } = await supabase
+          .from('opponent_game_lineups')
+          .delete()
+          .in('id', deletedOppLineups);
+        if (error) deferredErrors.push(`opponent_game_lineups delete: ${error.message}`);
       }
 
       // 4. Lineups — per-game whole-lineup replace, guarded by the conflict
@@ -755,6 +880,7 @@ function mapGame(r: Record<string, unknown>) {
     // schema can keep its required-string column. Display sites render an
     // empty value as 'TBD'.
     opponent_name: r.opponent_name ?? '',
+    opponent_team_id: r.opponent_team_id ?? null,
     scheduled_at: new Date(r.scheduled_at as string).getTime(),
     location_type: r.location_type,
     neutral_home_team: r.neutral_home_team ?? null,
@@ -829,6 +955,39 @@ function mapLeaguePlayer(r: Record<string, unknown>) {
     league_id: r.league_id,
     player_remote_id: r.player_id,
     registered_at: new Date(r.registered_at as string).getTime(),
+    synced_at: Date.now(),
+  };
+}
+
+function mapOpponentPlayer(r: Record<string, unknown>) {
+  return {
+    id: r.id,
+    remote_id: r.id,
+    opponent_team_id: r.opponent_team_id,
+    first_name: r.first_name,
+    last_name: r.last_name,
+    // Server column is text; coerce so a numeric-looking jersey still lands
+    // in a string column rather than tripping WatermelonDB's sanitizer.
+    jersey_number: r.jersey_number == null ? null : String(r.jersey_number),
+    primary_position: r.primary_position ?? null,
+    is_active: r.is_active ?? true,
+    updated_at: r.updated_at ? new Date(r.updated_at as string).getTime() : Date.now(),
+    synced_at: Date.now(),
+  };
+}
+
+function mapOpponentGameLineup(r: Record<string, unknown>) {
+  return {
+    id: r.id,
+    remote_id: r.id,
+    game_remote_id: r.game_id,
+    opponent_player_remote_id: r.opponent_player_id,
+    batting_order: r.batting_order ?? null,
+    starting_position: r.starting_position ?? null,
+    is_starter: r.is_starter ?? true,
+    // No updated_at server-side — this column is device bookkeeping, so
+    // stamp it at pull time.
+    updated_at: Date.now(),
     synced_at: Date.now(),
   };
 }

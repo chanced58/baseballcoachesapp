@@ -47,5 +47,44 @@ export const migrations = schemaMigrations({
         }),
       ],
     },
+    {
+      // v3: the opposing side. Local mirrors of opponent_players and
+      // opponent_game_lineups so a scorer can name opponent batters, and
+      // add them mid-game, with no signal at the field.
+      toVersion: 3,
+      steps: [
+        addColumns({
+          table: 'games',
+          columns: [{ name: 'opponent_team_id', type: 'string', isOptional: true, isIndexed: true }],
+        }),
+        createTable({
+          name: 'opponent_players',
+          columns: [
+            { name: 'remote_id', type: 'string', isIndexed: true },
+            { name: 'opponent_team_id', type: 'string', isIndexed: true },
+            { name: 'first_name', type: 'string' },
+            { name: 'last_name', type: 'string' },
+            { name: 'jersey_number', type: 'string', isOptional: true },
+            { name: 'primary_position', type: 'string', isOptional: true },
+            { name: 'is_active', type: 'boolean' },
+            { name: 'updated_at', type: 'number' },
+            { name: 'synced_at', type: 'number', isOptional: true },
+          ],
+        }),
+        createTable({
+          name: 'opponent_game_lineups',
+          columns: [
+            { name: 'remote_id', type: 'string', isIndexed: true },
+            { name: 'game_remote_id', type: 'string', isIndexed: true },
+            { name: 'opponent_player_remote_id', type: 'string', isIndexed: true },
+            { name: 'batting_order', type: 'number', isOptional: true },
+            { name: 'starting_position', type: 'string', isOptional: true },
+            { name: 'is_starter', type: 'boolean' },
+            { name: 'updated_at', type: 'number' },
+            { name: 'synced_at', type: 'number', isOptional: true },
+          ],
+        }),
+      ],
+    },
   ],
 });
