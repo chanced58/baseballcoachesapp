@@ -30,7 +30,7 @@ import type { Game } from '../../../../src/db/models/Game';
 import type { Player } from '../../../../src/db/models/Player';
 import type { BattedOutType, RosterPlayer, RunnerOutcome } from '../../../../src/features/scoring/PitchInput';
 import { useSyncContext } from '../../../../src/providers/SyncProvider';
-import { addLineupRow } from '../../../../src/features/lineup/local-guest';
+import { addLineupRow, createLocalGuest } from '../../../../src/features/lineup/local-guest';
 import { useGameLineups } from '../../../../src/features/lineup/use-game-lineups';
 import { useOpponentLineup, type OpponentBatter } from '../../../../src/features/lineup/use-opponent-lineup';
 import {
@@ -233,6 +233,7 @@ export default function ScoringScreen() {
   );
   const [showOpponentBatterPicker, setShowOpponentBatterPicker] = useState(false);
   const [showAddOpponentBatter, setShowAddOpponentBatter] = useState(false);
+  const [showAddOurBatter, setShowAddOurBatter] = useState(false);
 
   /**
    * Add someone to the opposing order mid-game, either from their known
@@ -265,6 +266,44 @@ export default function ScoringScreen() {
     setShowAddOpponentBatter(false);
     // Sync opportunistically — a failure here is invisible and harmless, the
     // rows are already durable locally and the next cycle will carry them.
+    triggerSync().catch(() => {});
+    return null;
+  }
+
+  /**
+   * Add someone to OUR order mid-game: a rostered player who wasn't in the
+   * pre-game lineup, or a late arrival who isn't on the roster at all.
+   *
+   * The second path creates a guest-only identity, the same shape the guest
+   * picker produces. It is offered whatever the league's guests.allowed
+   * setting says: that flag governs whether outside players may appear in a
+   * league's games, and a coach standing at a field with a player in front of
+   * them needs to record what actually happened either way. countTowardStats
+   * still follows the league default, so the rule keeps its effect on the
+   * numbers.
+   */
+  async function handleAddOurBatter(input:
+    | { kind: 'roster'; opponentPlayerId: string }
+    | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string }
+  ): Promise<string | null> {
+    if (input.kind === 'roster') {
+      await handleAddBatter(input.opponentPlayerId);
+      setShowAddOurBatter(false);
+      return null;
+    }
+
+    const jersey = input.jerseyNumber.trim();
+    const result = await createLocalGuest({
+      gameRemoteId: gameId,
+      leagueId: leagueId ?? null,
+      firstName: input.firstName.trim(),
+      lastName: input.lastName.trim(),
+      jerseyNumber: jersey ? Number(jersey) : null,
+      countTowardStats: leagueSettings.guests.countTowardStatsDefault,
+      maxBatters,
+    });
+    if (!result.ok) return result.message;
+    setShowAddOurBatter(false);
     triggerSync().catch(() => {});
     return null;
   }
@@ -1507,6 +1546,12 @@ export default function ScoringScreen() {
               <Text className="text-xs font-semibold text-white">Change</Text>
             </TouchableOpacity>
           )}
+          <TouchableOpacity
+            onPress={() => setShowAddOurBatter(true)}
+            className="ml-2 px-3 py-1 rounded-full bg-emerald-100"
+          >
+            <Text className="text-xs font-semibold text-emerald-800">+ Batter</Text>
+          </TouchableOpacity>
         </View>
       ) : (
         <View className="flex-row items-center justify-between px-4 py-2 bg-slate-50 border-t border-slate-100">
@@ -1582,14 +1627,29 @@ export default function ScoringScreen() {
         onCancel={() => setShowOpponentBatterPicker(false)}
       />
 
-      <AddOpponentBatterModal
+      <AddBatterModal
         visible={showAddOpponentBatter}
-        opponentName={opponentName as string}
+        title={`Add ${opponentName} batter`}
+        rosterLabel="ON THEIR ROSTER"
         roster={opponentRoster
           .filter((p) => !opponentNameById.has(p.remoteId))
           .map((p) => ({ id: p.remoteId, name: opponentDisplayName(p) }))}
         onSubmit={handleAddOpponentBatter}
         onCancel={() => setShowAddOpponentBatter(false)}
+      />
+
+      <AddBatterModal
+        visible={showAddOurBatter}
+        title="Add batter"
+        rosterLabel="ON YOUR ROSTER"
+        roster={roster
+          .filter((p) => !battingSlots.some((slot) => slot.playerId === p.id))
+          .map((p) => ({
+            id: p.id,
+            name: p.jerseyNumber != null ? `#${p.jerseyNumber} ${p.name}` : p.name,
+          }))}
+        onSubmit={handleAddOurBatter}
+        onCancel={() => setShowAddOurBatter(false)}
       />
 
       </StatePane>
@@ -1975,21 +2035,23 @@ function OpponentBatterPickerModal({
 }
 
 /**
- * Add a batter to the opposing order mid-game.
+ * Add a batter to an order mid-game — either side's.
  *
- * Two ways in, because a scorer meets the other team two ways: someone
- * already on their tracked roster, or a name and number read off a shirt.
- * The second is the common one, so it is not hidden behind the first.
+ * Two ways in, because a scorer meets a new batter two ways: someone already
+ * on a tracked roster, or a name and number read off a shirt. The second is
+ * the common one at the field, so it is not hidden behind the first.
  */
-function AddOpponentBatterModal({
+function AddBatterModal({
   visible,
-  opponentName,
+  title,
+  rosterLabel,
   roster,
   onSubmit,
   onCancel,
 }: {
   visible: boolean;
-  opponentName: string;
+  title: string;
+  rosterLabel: string;
   roster: Array<{ id: string; name: string }>;
   onSubmit: (
     input:
@@ -2030,7 +2092,7 @@ function AddOpponentBatterModal({
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
       <View className="flex-1 justify-end bg-black/50">
         <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '85%' }}>
-          <Text className="text-lg font-bold text-gray-900 mb-1">Add {opponentName} batter</Text>
+          <Text className="text-lg font-bold text-gray-900 mb-1">{title}</Text>
           <Text className="text-sm text-gray-500 mb-4">
             Goes to the end of their order. Saves on the device — it reaches
             the server whenever you have signal.
@@ -2081,7 +2143,7 @@ function AddOpponentBatterModal({
             {roster.length > 0 && (
               <>
                 <Text className="text-xs font-semibold text-gray-500 mt-6 mb-2">
-                  ON THEIR ROSTER
+                  {rosterLabel}
                 </Text>
                 <View className="gap-2">
                   {roster.map((p) => (
