@@ -6,6 +6,7 @@ import {
   Modal,
   ScrollView,
   Alert,
+  TextInput,
   useWindowDimensions,
 } from 'react-native';
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
@@ -31,6 +32,12 @@ import type { BattedOutType, RosterPlayer, RunnerOutcome } from '../../../../src
 import { useSyncContext } from '../../../../src/providers/SyncProvider';
 import { addLineupRow } from '../../../../src/features/lineup/local-guest';
 import { useGameLineups } from '../../../../src/features/lineup/use-game-lineups';
+import { useOpponentLineup, type OpponentBatter } from '../../../../src/features/lineup/use-opponent-lineup';
+import {
+  addNewOpponentBatter,
+  addOpponentBatterFromRoster,
+  opponentDisplayName,
+} from '../../../../src/features/lineup/opponent-lineup';
 
 /**
  * Live game scoring screen — the core feature of the mobile app.
@@ -197,26 +204,111 @@ export default function ScoringScreen() {
 
   const weBat = gameState ? (isHome ? !gameState.isTopOfInning : gameState.isTopOfInning) : false;
 
-  // Who follows. While we bat that is the on-deck hitter — one PA past the
-  // batter at the plate, and past a manual override too, so pointing the
-  // rotation at a different hitter moves on-deck with it. While the opponent
-  // bats nobody is at our plate, so the due batter IS who leads off our next
-  // turn, and showing the slot after them would skip a hitter.
+  // ─── The opposing side ───────────────────────────────────────────────────
+  // Their roster and batting order, mirrored locally so a scorer keeping the
+  // other team's book keeps working with no signal. Without this every
+  // opponent plate appearance is anonymous: nothing to attribute a hit to,
+  // and nothing to show the coach about who is coming up.
+  const { roster: opponentRoster, slots: opponentSlots } = useOpponentLineup(
+    gameId,
+    game?.opponentTeamId,
+  );
+  // Their completed PAs are the other half's — the mirror of ourTeamPAs.
+  const opponentPAs = gameState
+    ? (isHome ? gameState.completedTopHalfPAs : gameState.completedBottomHalfPAs)
+    : 0;
+  const opponentDueBatter = deriveDueBatter(
+    opponentSlots.map((s) => ({ playerId: s.playerId, battingOrder: s.battingOrder })),
+    opponentPAs,
+  );
+  const [opponentBatterOverrideId, setOpponentBatterOverrideId] = useState<string | null>(null);
+  useEffect(() => {
+    setOpponentBatterOverrideId(null);
+  }, [opponentPAs]);
+  const opponentBatterId =
+    opponentBatterOverrideId ?? opponentDueBatter?.playerId ?? gameState?.currentBatterId ?? null;
+  const opponentNameById = useMemo(
+    () => new Map(opponentSlots.map((s) => [s.playerId, s.name])),
+    [opponentSlots],
+  );
+  const [showOpponentBatterPicker, setShowOpponentBatterPicker] = useState(false);
+  const [showAddOpponentBatter, setShowAddOpponentBatter] = useState(false);
+
+  /**
+   * Add someone to the opposing order mid-game, either from their known
+   * roster or as a brand-new name. Both write locally first; the sync engine
+   * pushes the player before the lineup row so the FK holds.
+   */
+  async function handleAddOpponentBatter(input:
+    | { kind: 'roster'; opponentPlayerId: string }
+    | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string }
+  ): Promise<string | null> {
+    const result =
+      input.kind === 'roster'
+        ? await addOpponentBatterFromRoster({
+            gameRemoteId: gameId,
+            opponentPlayerRemoteId: input.opponentPlayerId,
+            maxBatters,
+          })
+        : game?.opponentTeamId
+          ? await addNewOpponentBatter({
+              gameRemoteId: gameId,
+              opponentTeamId: game.opponentTeamId,
+              firstName: input.firstName,
+              lastName: input.lastName,
+              jerseyNumber: input.jerseyNumber,
+              maxBatters,
+            })
+          : ({ ok: false, message: 'This game has no opponent team on file.' } as const);
+
+    if (!result.ok) return result.message;
+    setShowAddOpponentBatter(false);
+    // Sync opportunistically — a failure here is invisible and harmless, the
+    // rows are already durable locally and the next cycle will carry them.
+    triggerSync().catch(() => {});
+    return null;
+  }
+
+  // Who follows the batter at the plate, in whichever order is batting —
+  // one PA past the current hitter, and past a manual override too, so
+  // pointing the rotation at someone else moves on-deck with it.
+  //
+  // Falls back to our own due batter when the opponent is up and we have no
+  // order for them: nobody is at our plate then, so the due batter already IS
+  // who leads off our next turn and the slot after them would skip a hitter.
   const nextBatter = useMemo(() => {
-    if (battingSlots.length === 0) return null;
-    if (!weBat) return dueBatter;
-    const overrideIndex = batterOverrideId
-      ? [...battingSlots]
+    const slots = weBat
+      ? battingSlots
+      : opponentSlots.map((s) => ({ playerId: s.playerId, battingOrder: s.battingOrder }));
+    const overrideId = weBat ? batterOverrideId : opponentBatterOverrideId;
+    const current = weBat ? dueBatter : opponentDueBatter;
+
+    if (slots.length === 0) return weBat ? null : dueBatter;
+
+    const overrideIndex = overrideId
+      ? [...slots]
           .sort((a, b) => a.battingOrder - b.battingOrder)
-          .findIndex((slot) => slot.playerId === batterOverrideId)
+          .findIndex((slot) => slot.playerId === overrideId)
       : -1;
-    const currentIndex = overrideIndex >= 0 ? overrideIndex : dueBatter?.index ?? -1;
+    const currentIndex = overrideIndex >= 0 ? overrideIndex : current?.index ?? -1;
     if (currentIndex < 0) return null;
-    return deriveDueBatter(battingSlots, currentIndex + 1);
-  }, [battingSlots, weBat, dueBatter, batterOverrideId]);
+    return deriveDueBatter(slots, currentIndex + 1);
+  }, [
+    weBat, battingSlots, opponentSlots, batterOverrideId,
+    opponentBatterOverrideId, dueBatter, opponentDueBatter,
+  ]);
+  /**
+   * Name for a next-up slot. The id came from whichever order is batting, so
+   * try the opponent's names first and fall back to ours — the two id spaces
+   * are disjoint (players vs opponent_players), so a hit is unambiguous.
+   */
+  const nextBatterName = (playerId: string) =>
+    opponentNameById.get(playerId) ?? batterName(playerId);
   // Effective batter for our offensive half: manual override → lineup-derived
   // due batter → engine state (GAME_START leadoff when no lineup is set).
   const ourBatterId = batterOverrideId ?? dueBatter?.playerId ?? gameState?.currentBatterId ?? null;
+  /** Whoever is actually at the plate right now, either side. */
+  const currentPlateBatterId = weBat ? ourBatterId : opponentBatterId;
 
   // Our current pitcher, derived from the event stream so it persists across
   // innings — gameState.currentPitcherId is reset to null by INNING_CHANGE, so
@@ -257,7 +349,12 @@ export default function ScoringScreen() {
         ourBatterId,
         ourPitcherId,
         statePitcherId: gameState.currentPitcherId,
-        stateBatterId: gameState.currentBatterId,
+        // Prefer the batter derived from the opponent's own order over
+        // gameState.currentBatterId. The latter is only ever set by a
+        // previous PITCH_THROWN, so for an opponent half it is null until
+        // someone has already batted anonymously — which is exactly the gap
+        // that left their runners without an identity.
+        stateBatterId: opponentBatterId ?? gameState.currentBatterId,
         ourPlayerIds,
       })
     : {};
@@ -1412,21 +1509,49 @@ export default function ScoringScreen() {
           )}
         </View>
       ) : (
-        <View className="px-4 py-2 bg-gray-50 border-t border-gray-100">
-          <Text className="text-xs text-gray-500">Opponent batting</Text>
+        <View className="flex-row items-center justify-between px-4 py-2 bg-slate-50 border-t border-slate-100">
+          <Text className="flex-1 text-sm text-slate-900" numberOfLines={1}>
+            <Text className="text-xs text-slate-600">{opponentName} batting{'  '}</Text>
+            <Text className="font-semibold">
+              {opponentBatterId
+                ? opponentNameById.get(opponentBatterId) ?? 'Unnamed batter'
+                : 'No batter set'}
+            </Text>
+            {opponentBatterOverrideId && opponentBatterOverrideId !== opponentDueBatter?.playerId ? (
+              <Text className="text-xs text-amber-700">{'  '}(override)</Text>
+            ) : opponentDueBatter && opponentBatterId === opponentDueBatter.playerId ? (
+              <Text className="text-xs text-slate-600">{'  '}(slot {opponentDueBatter.battingOrder})</Text>
+            ) : null}
+          </Text>
+          {opponentSlots.length > 0 && (
+            <TouchableOpacity
+              onPress={() => setShowOpponentBatterPicker(true)}
+              className="ml-2 px-3 py-1 rounded-full bg-slate-600"
+            >
+              <Text className="text-xs font-semibold text-white">Change</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity
+            onPress={() => setShowAddOpponentBatter(true)}
+            className="ml-2 px-3 py-1 rounded-full bg-slate-200"
+          >
+            <Text className="text-xs font-semibold text-slate-700">+ Batter</Text>
+          </TouchableOpacity>
         </View>
       ))}
 
       {/* Next up — on deck while we bat, leading off our next half while the
           opponent does. Named for what it is in each case so the scorer
           doesn't have to work out which. */}
-      {gameStarted && nextBatter && (
+      {/* An order of one wraps onto itself, so on-deck would just repeat the
+          batter at the plate — say nothing rather than something confusing. */}
+      {gameStarted && nextBatter && nextBatter.playerId !== currentPlateBatterId && (
         <View className="flex-row items-center px-4 py-2 border-t border-gray-100">
           <Text className="text-xs text-gray-500 w-20">
-            {weBat ? 'On deck' : 'Up next'}
+            {weBat || opponentSlots.length > 0 ? 'On deck' : 'Up next'}
           </Text>
           <Text className="flex-1 text-sm text-gray-900" numberOfLines={1}>
-            <Text className="font-semibold">{batterName(nextBatter.playerId)}</Text>
+            <Text className="font-semibold">{nextBatterName(nextBatter.playerId)}</Text>
             <Text className="text-xs text-gray-500">{'  '}slot {nextBatter.battingOrder}</Text>
           </Text>
         </View>
@@ -1443,6 +1568,28 @@ export default function ScoringScreen() {
           setShowBatterPicker(false);
         }}
         onCancel={() => setShowBatterPicker(false)}
+      />
+
+      <OpponentBatterPickerModal
+        visible={showOpponentBatterPicker}
+        slots={opponentSlots}
+        dueBatterId={opponentDueBatter?.playerId ?? null}
+        selectedId={opponentBatterId}
+        onSelect={(playerId) => {
+          setOpponentBatterOverrideId(playerId);
+          setShowOpponentBatterPicker(false);
+        }}
+        onCancel={() => setShowOpponentBatterPicker(false)}
+      />
+
+      <AddOpponentBatterModal
+        visible={showAddOpponentBatter}
+        opponentName={opponentName as string}
+        roster={opponentRoster
+          .filter((p) => !opponentNameById.has(p.remoteId))
+          .map((p) => ({ id: p.remoteId, name: opponentDisplayName(p) }))}
+        onSubmit={handleAddOpponentBatter}
+        onCancel={() => setShowAddOpponentBatter(false)}
       />
 
       </StatePane>
@@ -1745,6 +1892,213 @@ function BatterPickerModal({
               })}
             </View>
           </ScrollView>
+          <TouchableOpacity
+            className="mt-4 rounded-xl px-5 py-3 bg-gray-100 items-center"
+            onPress={onCancel}
+          >
+            <Text className="text-gray-700 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/**
+ * Same rotation override as our own order, for the opposing lineup. Their
+ * batting order drifts more than ours — the scorer is reading it off a
+ * shouted announcement — so pointing at the right hitter matters.
+ */
+function OpponentBatterPickerModal({
+  visible,
+  slots,
+  dueBatterId,
+  selectedId,
+  onSelect,
+  onCancel,
+}: {
+  visible: boolean;
+  slots: OpponentBatter[];
+  dueBatterId: string | null;
+  selectedId: string | null;
+  onSelect: (playerId: string) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '75%' }}>
+          <Text className="text-lg font-bold text-gray-900 mb-1">Opponent at the plate</Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            Pick who is batting. The rotation resumes from this batter after
+            the plate appearance completes.
+          </Text>
+          <ScrollView className="max-h-96">
+            <View className="gap-2">
+              {slots.map((slot) => {
+                const isSelected = slot.playerId === selectedId;
+                const isDue = slot.playerId === dueBatterId;
+                return (
+                  <TouchableOpacity
+                    key={slot.playerId}
+                    className={`flex-row items-center rounded-xl px-4 py-3 border ${
+                      isSelected ? 'bg-slate-600 border-slate-700' : 'bg-white border-gray-300'
+                    }`}
+                    onPress={() => onSelect(slot.playerId)}
+                  >
+                    <Text className={`w-8 font-bold ${isSelected ? 'text-white' : 'text-gray-400'}`}>
+                      {slot.battingOrder}
+                    </Text>
+                    <Text className={`flex-1 font-semibold ${isSelected ? 'text-white' : 'text-gray-900'}`}>
+                      {slot.name}
+                    </Text>
+                    {isDue && (
+                      <Text className={`text-xs font-semibold ${isSelected ? 'text-slate-100' : 'text-slate-600'}`}>
+                        due up
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </ScrollView>
+          <TouchableOpacity
+            className="mt-4 rounded-xl px-5 py-3 bg-gray-100 items-center"
+            onPress={onCancel}
+          >
+            <Text className="text-gray-700 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/**
+ * Add a batter to the opposing order mid-game.
+ *
+ * Two ways in, because a scorer meets the other team two ways: someone
+ * already on their tracked roster, or a name and number read off a shirt.
+ * The second is the common one, so it is not hidden behind the first.
+ */
+function AddOpponentBatterModal({
+  visible,
+  opponentName,
+  roster,
+  onSubmit,
+  onCancel,
+}: {
+  visible: boolean;
+  opponentName: string;
+  roster: Array<{ id: string; name: string }>;
+  onSubmit: (
+    input:
+      | { kind: 'roster'; opponentPlayerId: string }
+      | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string },
+  ) => Promise<string | null>;
+  onCancel: () => void;
+}) {
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [jersey, setJersey] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // Clear between openings so a previous entry (or error) never bleeds into
+  // the next batter the scorer adds.
+  useEffect(() => {
+    if (!visible) return;
+    setFirstName('');
+    setLastName('');
+    setJersey('');
+    setError(null);
+    setBusy(false);
+  }, [visible]);
+
+  async function run(
+    input:
+      | { kind: 'roster'; opponentPlayerId: string }
+      | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string },
+  ) {
+    if (busy) return;
+    setBusy(true);
+    setError(await onSubmit(input));
+    setBusy(false);
+  }
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '85%' }}>
+          <Text className="text-lg font-bold text-gray-900 mb-1">Add {opponentName} batter</Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            Goes to the end of their order. Saves on the device — it reaches
+            the server whenever you have signal.
+          </Text>
+
+          {error && (
+            <View className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200">
+              <Text className="text-sm text-red-700">{error}</Text>
+            </View>
+          )}
+
+          <ScrollView className="max-h-96">
+            <Text className="text-xs font-semibold text-gray-500 mb-2">NEW BATTER</Text>
+            <View className="flex-row gap-2">
+              <TextInput
+                value={jersey}
+                onChangeText={setJersey}
+                placeholder="##"
+                keyboardType="number-pad"
+                className="w-16 rounded-xl border border-gray-300 px-3 py-3 text-base text-gray-900"
+              />
+              <TextInput
+                value={firstName}
+                onChangeText={setFirstName}
+                placeholder="First"
+                autoCapitalize="words"
+                className="flex-1 rounded-xl border border-gray-300 px-3 py-3 text-base text-gray-900"
+              />
+              <TextInput
+                value={lastName}
+                onChangeText={setLastName}
+                placeholder="Last"
+                autoCapitalize="words"
+                className="flex-1 rounded-xl border border-gray-300 px-3 py-3 text-base text-gray-900"
+              />
+            </View>
+            <TouchableOpacity
+              disabled={busy}
+              onPress={() => run({ kind: 'new', firstName, lastName, jerseyNumber: jersey })}
+              className={`mt-3 rounded-xl py-3 items-center ${busy ? 'bg-slate-300' : 'bg-slate-700'}`}
+            >
+              <Text className="text-white font-semibold">Add to order</Text>
+            </TouchableOpacity>
+            <Text className="text-xs text-gray-400 mt-2">
+              A jersey number on its own is enough — you can add the name later.
+            </Text>
+
+            {roster.length > 0 && (
+              <>
+                <Text className="text-xs font-semibold text-gray-500 mt-6 mb-2">
+                  ON THEIR ROSTER
+                </Text>
+                <View className="gap-2">
+                  {roster.map((p) => (
+                    <TouchableOpacity
+                      key={p.id}
+                      disabled={busy}
+                      className="rounded-xl px-4 py-3 bg-white border border-slate-300"
+                      onPress={() => run({ kind: 'roster', opponentPlayerId: p.id })}
+                    >
+                      <Text className="text-slate-800 font-semibold text-base">{p.name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </>
+            )}
+          </ScrollView>
+
           <TouchableOpacity
             className="mt-4 rounded-xl px-5 py-3 bg-gray-100 items-center"
             onPress={onCancel}
