@@ -845,3 +845,52 @@ describe('deriveGameState — anonymous opponent batters', () => {
     expect(batting.has(state.runnersOnBase.first!)).toBe(false);
   });
 });
+
+describe('deriveGameState — pitch and strike totals', () => {
+  beforeEach(resetSeq);
+
+  const pitch = (pitcherId: string, outcome: PitchOutcome) =>
+    e(EventType.PITCH_THROWN, { batterId: 'a1', pitcherId, outcome });
+
+  it('counts every pitch that is not a ball or hit batsman as a strike', () => {
+    const state = deriveGameState(GAME, [
+      e(EventType.GAME_START, { homeLineupPitcherId: 'p1' }),
+      pitch('p1', PitchOutcome.CALLED_STRIKE),
+      pitch('p1', PitchOutcome.SWINGING_STRIKE),
+      pitch('p1', PitchOutcome.FOUL),
+      pitch('p1', PitchOutcome.FOUL_TIP),
+      pitch('p1', PitchOutcome.IN_PLAY),
+      pitch('p1', PitchOutcome.BALL),
+      pitch('p1', PitchOutcome.INTENTIONAL_BALL),
+      pitch('p1', PitchOutcome.HIT_BY_PITCH),
+    ], HOME_TEAM);
+
+    expect(state.pitcherPitchCounts.p1).toBe(8);
+    expect(state.pitcherStrikeCounts.p1).toBe(5);
+  });
+
+  it('keeps strikes separate per pitcher across a pitching change', () => {
+    const state = deriveGameState(GAME, [
+      e(EventType.GAME_START, { homeLineupPitcherId: 'p1' }),
+      pitch('p1', PitchOutcome.CALLED_STRIKE),
+      pitch('p1', PitchOutcome.BALL),
+      pitch('p2', PitchOutcome.FOUL),
+      pitch('p2', PitchOutcome.SWINGING_STRIKE),
+      pitch('p2', PitchOutcome.BALL),
+    ], HOME_TEAM);
+
+    expect(state.pitcherStrikeCounts.p1).toBe(1);
+    expect(state.pitcherPitchCounts.p1).toBe(2);
+    expect(state.pitcherStrikeCounts.p2).toBe(2);
+    expect(state.pitcherPitchCounts.p2).toBe(3);
+  });
+
+  it('reports no strikes for a pitcher who has thrown none', () => {
+    const state = deriveGameState(GAME, [
+      e(EventType.GAME_START, { homeLineupPitcherId: 'p1' }),
+      pitch('p1', PitchOutcome.BALL),
+    ], HOME_TEAM);
+
+    expect(state.pitcherStrikeCounts.p1 ?? 0).toBe(0);
+  });
+});

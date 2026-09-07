@@ -83,11 +83,13 @@ export function deriveGameState(
     awayLeadoffBatterId: null,
     isFinal: false,
     pitcherPitchCounts: {},
+    pitcherStrikeCounts: {},
   };
 
-  // Alias — mutated by PITCH_THROWN below; exposed on the returned state so
-  // consumers (pitch-count compliance UI) can read every pitcher's total.
+  // Aliases — mutated by PITCH_THROWN below; exposed on the returned state so
+  // consumers (pitch-count compliance UI) can read every pitcher's totals.
   const pitcherCounts = state.pitcherPitchCounts;
+  const strikeCounts = state.pitcherStrikeCounts;
 
   for (const event of activeEvents) {
     switch (event.eventType) {
@@ -123,6 +125,16 @@ export function deriveGameState(
         if (pitcherId) {
           pitcherCounts[pitcherId] = (pitcherCounts[pitcherId] ?? 0) + 1;
           state.currentPitcherPitchCount = pitcherCounts[pitcherId];
+          // A strike is any pitch that isn't a ball or a hit batsman —
+          // fouls and balls put in play included. Counted here, alongside
+          // the pitch itself, so the two totals can never drift apart.
+          if (
+            p.outcome !== 'ball' &&
+            p.outcome !== 'intentional_ball' &&
+            p.outcome !== 'hit_by_pitch'
+          ) {
+            strikeCounts[pitcherId] = (strikeCounts[pitcherId] ?? 0) + 1;
+          }
         }
 
         switch (p.outcome) {
