@@ -20,9 +20,17 @@ interface BaserunnerDisplayProps {
   onRecordPinchRunner?: (fromBase: Base, outRunnerId: string, inRunnerId: string) => void;
   onRecordCourtesyRunner?: (fromBase: Base, outRunnerId: string, inRunnerId: string) => void;
   roster?: RosterPlayer[];
+  /**
+   * Short identifier for the runner on a base — a jersey number where we have
+   * one. Without it the diamond says someone is on second but not who, which
+   * is the one thing the scorer needs when deciding whether to send them.
+   */
+  runnerShortLabel?: (runnerId: string) => string;
+  /** Full name, for the action sheet's title. */
+  runnerName?: (runnerId: string) => string;
 }
 
-const DIAMOND_SIZE = 100;
+const DIAMOND_SIZE = 116;
 
 /**
  * Renders a baseball diamond with filled bases for occupied runners.
@@ -38,6 +46,8 @@ export function BaserunnerDisplay({
   onRecordPinchRunner,
   onRecordCourtesyRunner,
   roster,
+  runnerShortLabel,
+  runnerName,
 }: BaserunnerDisplayProps) {
   const { first, second, third } = gameState.runnersOnBase;
   const [selected, setSelected] = useState<{ base: Base; runnerId: string } | null>(null);
@@ -109,32 +119,35 @@ export function BaserunnerDisplay({
       className="items-center justify-center"
       style={{ width: DIAMOND_SIZE, height: DIAMOND_SIZE }}
     >
-      <View className="relative" style={{ width: 80, height: 80 }}>
+      <View className="relative" style={{ width: 96, height: 96 }}>
         <BaseTap
           base={2}
           runnerId={second}
-          style={{ top: 0, left: 30 }}
+          style={{ top: 0, left: 34 }}
           onPress={handleBaseTap}
           interactive={interactive}
+          label={second ? runnerShortLabel?.(second) : undefined}
         />
         <BaseTap
           base={3}
           runnerId={third}
-          style={{ top: 30, left: 0 }}
+          style={{ top: 34, left: 0 }}
           onPress={handleBaseTap}
           interactive={interactive}
+          label={third ? runnerShortLabel?.(third) : undefined}
         />
         <BaseTap
           base={1}
           runnerId={first}
-          style={{ top: 30, left: 60 }}
+          style={{ top: 34, left: 68 }}
           onPress={handleBaseTap}
           interactive={interactive}
+          label={first ? runnerShortLabel?.(first) : undefined}
         />
         {/* Home plate — bottom center (indicator only) */}
         <View
           className="absolute w-4 h-4 bg-gray-300 rotate-45"
-          style={{ bottom: 0, left: 32 }}
+          style={{ bottom: 0, left: 40 }}
         />
       </View>
 
@@ -147,7 +160,9 @@ export function BaserunnerDisplay({
         <View className="flex-1 justify-end bg-black/50">
           <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5">
             <Text className="text-lg font-bold text-gray-900 mb-1">
-              Runner on {selected ? baseLabel(selected.base) : ''}
+              {selected
+                ? `${runnerName?.(selected.runnerId) ?? 'Runner'} on ${baseLabel(selected.base)}`
+                : ''}
             </Text>
             <Text className="text-sm text-gray-500 mb-4">
               What just happened to this runner?
@@ -279,33 +294,45 @@ function BaseTap({
   style,
   onPress,
   interactive,
+  label,
 }: {
   base: Base;
   runnerId: string | null;
   style: object;
   onPress: (base: Base, runnerId: string | null) => void;
   interactive: boolean;
+  label?: string;
 }) {
   const occupied = !!runnerId;
   const fill = occupied
-    ? 'bg-yellow-400 border-2 border-yellow-500'
+    ? 'bg-amber-300 border-2 border-amber-500'
     : 'bg-gray-200 border-2 border-gray-300';
+  // The base is drawn rotated 45°; the label inside has to be turned back or
+  // it reads on the diagonal.
+  const content = occupied && label ? (
+    <View className="flex-1 items-center justify-center -rotate-45">
+      <Text className="text-[10px] font-bold text-amber-900" numberOfLines={1}>
+        {label}
+      </Text>
+    </View>
+  ) : null;
 
   if (!interactive || !occupied) {
     return (
-      <View
-        className={`absolute w-5 h-5 rotate-45 ${fill}`}
-        style={style}
-      />
+      <View className={`absolute w-7 h-7 rotate-45 ${fill}`} style={style}>
+        {content}
+      </View>
     );
   }
 
   return (
     <TouchableOpacity
-      className={`absolute w-5 h-5 rotate-45 ${fill}`}
+      className={`absolute w-7 h-7 rotate-45 ${fill}`}
       style={style}
       onPress={() => onPress(base, runnerId)}
-    />
+    >
+      {content}
+    </TouchableOpacity>
   );
 }
 

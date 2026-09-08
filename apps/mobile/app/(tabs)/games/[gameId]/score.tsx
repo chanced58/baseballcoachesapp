@@ -1312,6 +1312,46 @@ export default function ScoringScreen() {
     return out;
   }, [firstRunner, secondRunner, thirdRunner]);
 
+  // ─── Naming the runners ──────────────────────────────────────────────────
+  // A runner id is one of ours, one of the opponent's, or — for an opponent
+  // half scored without their order entered — a stand-in the engine minted to
+  // hold the base. The two id spaces are disjoint, so trying each in turn is
+  // unambiguous; the stand-in matches nothing and stays deliberately unnamed
+  // rather than borrowing someone else's name.
+  const runnerIdentity = useMemo(() => {
+    const m = new Map<string, { name: string; short: string }>();
+    for (const p of roster) {
+      m.set(p.id, {
+        name: p.jerseyNumber != null ? `#${p.jerseyNumber} ${p.name}` : p.name,
+        short: p.jerseyNumber != null ? String(p.jerseyNumber) : initialsOf(p.name),
+      });
+    }
+    for (const s of opponentSlots) {
+      m.set(s.playerId, {
+        name: s.name,
+        short: s.jerseyNumber || String(s.battingOrder),
+      });
+    }
+    return m;
+  }, [roster, opponentSlots]);
+
+  const runnerName = (id: string) =>
+    runnerIdentity.get(id)?.name ?? nameById.get(id) ?? extraNames[id] ?? 'Unnamed runner';
+  const runnerShortLabel = (id: string) => {
+    const known = runnerIdentity.get(id)?.short;
+    if (known) return known;
+    const fallback = nameById.get(id) ?? extraNames[id];
+    return fallback ? initialsOf(fallback) : '•';
+  };
+  const namedRunners = useMemo(
+    () =>
+      // Lead runner first: that is the one a coach decides about.
+      [...runnersOnBase]
+        .sort((a, b) => b.base - a.base)
+        .map((r) => ({ ...r, name: runnerName(r.runnerId) })),
+    [runnersOnBase, runnerIdentity, nameById, extraNames],
+  );
+
   if (loading || !gameState) {
     return <LoadingSpinner fullScreen />;
   }
@@ -1488,6 +1528,8 @@ export default function ScoringScreen() {
               : undefined
           }
           roster={roster}
+          runnerShortLabel={runnerShortLabel}
+          runnerName={runnerName}
         />
         {/* Offline is a normal state for field scoring, so it reads as
             information, not a fault. A red warning is reserved for a sync
@@ -1667,6 +1709,16 @@ export default function ScoringScreen() {
 
       </BookPane>
       <ActionPane isWide={isWide}>
+
+      {gameStarted && (
+        <RunnersPanel
+          runners={namedRunners}
+          onSteal={handleStolenBase}
+          onCaught={handleCaughtStealing}
+          onAdvance={handleRunnerAdvance}
+          onPickoff={handlePickoffOut}
+        />
+      )}
 
       {gameStarted && (
         <PitchCountStrip
@@ -1996,6 +2048,101 @@ function BatterPickerModal({
         </View>
       </View>
     </Modal>
+  );
+}
+
+/** "Griffin Baldwin" -> "GB"; the fallback when we have no jersey number. */
+function initialsOf(name: string): string {
+  const parts = name.replace(/^#\S+\s*/, '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '\u2022';
+  return parts.slice(0, 2).map((w) => w[0]!.toUpperCase()).join('');
+}
+
+/** One runner action — a quiet pill, since a row of these sits under a name. */
+function RunnerAction({
+  label,
+  tone,
+  onPress,
+}: {
+  label: string;
+  tone: string;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity className={`px-2.5 py-1.5 rounded-lg border ${tone}`} onPress={onPress}>
+      <Text className="text-[11px] font-semibold">{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+const BASE_ABBREV: Record<1 | 2 | 3, string> = { 1: '1B', 2: '2B', 3: '3B' };
+
+/**
+ * Who is on base and what can happen to them, in one place.
+ *
+ * These plays were reachable only by tapping a base in the diamond or opening
+ * the Runners sheet — two drills for the events that happen while the scorer
+ * is already watching a pitch. With someone aboard the choices are few and
+ * known, so they are laid out rather than hidden.
+ *
+ * The rarer per-runner plays (pinch runner, courtesy runner) stay behind the
+ * base tap: they are substitutions, not pitches, and are not worth the room.
+ */
+function RunnersPanel({
+  runners,
+  onSteal,
+  onCaught,
+  onAdvance,
+  onPickoff,
+}: {
+  runners: Array<{ base: 1 | 2 | 3; runnerId: string; name: string }>;
+  onSteal: (base: 1 | 2 | 3, runnerId: string) => void;
+  onCaught: (base: 1 | 2 | 3, runnerId: string) => void;
+  onAdvance: (base: 1 | 2 | 3, runnerId: string, reason: AdvanceReason) => void;
+  onPickoff: (base: 1 | 2 | 3, runnerId: string) => void;
+}) {
+  if (runners.length === 0) return null;
+  return (
+    <View className="px-4 py-2 border-b border-gray-200 bg-white">
+      <Text className="text-[11px] font-semibold text-gray-500 mb-1.5">ON BASE</Text>
+      <View className="gap-1.5">
+        {runners.map((r) => (
+          <View key={`${r.base}-${r.runnerId}`} className="flex-row items-center gap-1.5">
+            <View className="w-8 py-1 rounded-md bg-amber-100 items-center">
+              <Text className="text-[11px] font-bold text-amber-800">{BASE_ABBREV[r.base]}</Text>
+            </View>
+            <Text className="flex-1 text-[13px] text-gray-900" numberOfLines={1}>
+              {r.name}
+            </Text>
+            <RunnerAction
+              label="Steal"
+              tone="bg-sky-50 border-sky-200"
+              onPress={() => onSteal(r.base, r.runnerId)}
+            />
+            <RunnerAction
+              label="Caught"
+              tone="bg-rose-50 border-rose-200"
+              onPress={() => onCaught(r.base, r.runnerId)}
+            />
+            <RunnerAction
+              label="Wild pitch"
+              tone="bg-amber-50 border-amber-200"
+              onPress={() => onAdvance(r.base, r.runnerId, AdvanceReason.WILD_PITCH)}
+            />
+            <RunnerAction
+              label="Passed ball"
+              tone="bg-yellow-50 border-yellow-200"
+              onPress={() => onAdvance(r.base, r.runnerId, AdvanceReason.PASSED_BALL)}
+            />
+            <RunnerAction
+              label="Pickoff"
+              tone="bg-slate-100 border-slate-300"
+              onPress={() => onPickoff(r.base, r.runnerId)}
+            />
+          </View>
+        ))}
+      </View>
+    </View>
   );
 }
 
