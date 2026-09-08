@@ -348,6 +348,13 @@ export default function ScoringScreen() {
   const ourBatterId = batterOverrideId ?? dueBatter?.playerId ?? gameState?.currentBatterId ?? null;
   /** Whoever is actually at the plate right now, either side. */
   const currentPlateBatterId = weBat ? ourBatterId : opponentBatterId;
+  const battingOrderTitle = weBat
+    ? `${teamName} batting order`
+    : `${opponentName} batting order`;
+  const onDeckBatterId =
+    nextBatter && nextBatter.playerId !== currentPlateBatterId
+      ? nextBatter.playerId
+      : null;
 
 
   // Our current pitcher, derived from the event stream so it persists across
@@ -1623,19 +1630,15 @@ export default function ScoringScreen() {
       {/* Next up — on deck while we bat, leading off our next half while the
           opponent does. Named for what it is in each case so the scorer
           doesn't have to work out which. */}
-      {/* The batting team's order. On deck is marked inside the list, so the
-          separate on-deck line only appears when there is no order to show —
-          the opponent's book before anyone has been entered. */}
-      {gameStarted && battingOrderView.length > 0 && (
+      {/* On a tablet the order lives in its own rail down the left edge (see
+          the end of PaneRow) — stacked phone layouts have no room for a third
+          column, so it stays inline there. */}
+      {!isWide && gameStarted && battingOrderView.length > 0 && (
         <BattingOrderCard
-          title={weBat ? `${teamName} batting order` : `${opponentName} batting order`}
+          title={battingOrderTitle}
           rows={battingOrderView}
           currentBatterId={currentPlateBatterId}
-          onDeckBatterId={
-            nextBatter && nextBatter.playerId !== currentPlateBatterId
-              ? nextBatter.playerId
-              : null
-          }
+          onDeckBatterId={onDeckBatterId}
           accent={weBat ? 'ours' : 'theirs'}
         />
       )}
@@ -1806,6 +1809,18 @@ export default function ScoringScreen() {
       )}
 
       </InputPane>
+      {isWide && gameStarted && battingOrderView.length > 0 && (
+        <LineupRail>
+          <BattingOrderCard
+            title={battingOrderTitle}
+            rows={battingOrderView}
+            currentBatterId={currentPlateBatterId}
+            onDeckBatterId={onDeckBatterId}
+            accent={weBat ? 'ours' : 'theirs'}
+            rail
+          />
+        </LineupRail>
+      )}
       </PaneRow>
     </View>
   );
@@ -1854,6 +1869,22 @@ function StatePane({ isWide, children }: { isWide: boolean; children: ReactNode 
 function InputPane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
   if (!isWide) return <>{children}</>;
   return <View style={{ flex: 1 }}>{children}</View>;
+}
+
+/**
+ * The batting order's own column, down the left edge.
+ *
+ * A lineup is a fixed, narrow list that the scorer glances at rather than
+ * works in, so it wants a rail, not a share of the split. Given a fixed width
+ * it costs the two working panes a strip instead of half of one, and both
+ * keep an equal share of what is left.
+ */
+function LineupRail({ children }: { children: ReactNode }) {
+  return (
+    <View className="border-r border-gray-200 bg-gray-50" style={{ width: 196 }}>
+      {children}
+    </View>
+  );
 }
 
 /** Pitches / strikes / strike% for one line of the strip. */
@@ -2051,12 +2082,15 @@ function BattingOrderCard({
   currentBatterId,
   onDeckBatterId,
   accent,
+  rail = false,
 }: {
   title: string;
   rows: BattingOrderRow[];
   currentBatterId: string | null;
   onDeckBatterId: string | null;
   accent: 'ours' | 'theirs';
+  /** Rendered in the narrow left rail rather than inline in a pane. */
+  rail?: boolean;
 }) {
   if (rows.length === 0) return null;
   // Our half and theirs read as two different cards, so the eye can tell
@@ -2064,10 +2098,13 @@ function BattingOrderCard({
   const atBatRow = accent === 'ours' ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-100 border-slate-300';
   const atBatText = accent === 'ours' ? 'text-emerald-900' : 'text-slate-900';
   const slotText = accent === 'ours' ? 'text-emerald-700' : 'text-slate-600';
+  const markerColor = accent === 'ours' ? 'bg-emerald-500' : 'bg-slate-500';
 
   return (
-    <View className="px-4 pt-2 pb-1 border-t border-gray-100">
-      <Text className="text-[11px] font-semibold text-gray-500 mb-0.5">{title}</Text>
+    <View className={rail ? 'px-2 pt-2 pb-1' : 'px-4 pt-2 pb-1 border-t border-gray-100'}>
+      <Text className="text-[11px] font-semibold text-gray-500 mb-0.5" numberOfLines={rail ? 2 : 1}>
+        {title}
+      </Text>
       {/* No row gap and tight padding: a ten-deep order has to fit the pane
           without scrolling, or the scorer loses the bottom of the lineup at
           exactly the moment the order turns over. */}
@@ -2083,7 +2120,9 @@ function BattingOrderCard({
               }`}
             >
               <Text
-                className={`w-6 text-xs font-bold ${isAtBat ? slotText : 'text-gray-400'}`}
+                className={`${rail ? 'w-4' : 'w-6'} text-xs font-bold ${
+                  isAtBat ? slotText : 'text-gray-400'
+                }`}
               >
                 {row.battingOrder}
               </Text>
@@ -2096,13 +2135,28 @@ function BattingOrderCard({
                 {row.name}
               </Text>
               {row.position && (
-                <Text className="w-8 text-[11px] text-gray-400 text-right">
+                <Text className="w-7 text-[11px] text-gray-400 text-right">
                   {POSITION_ABBREV[row.position] ?? ''}
                 </Text>
               )}
-              <Text className={`w-16 text-[10px] font-semibold text-right ${slotText}`}>
-                {isAtBat ? 'AT BAT' : isOnDeck ? 'on deck' : ''}
-              </Text>
+              {/* "AT BAT" does not fit a 168pt rail beside a name, so the
+                  status becomes a mark at the edge: solid for the batter,
+                  hollow for on deck. Inline panes keep the words. */}
+              {rail ? (
+                <View className="w-3 items-end">
+                  {(isAtBat || isOnDeck) && (
+                    <View
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        isAtBat ? markerColor : `border ${markerColor.replace('bg-', 'border-')}`
+                      }`}
+                    />
+                  )}
+                </View>
+              ) : (
+                <Text className={`w-16 text-[10px] font-semibold text-right ${slotText}`}>
+                  {isAtBat ? 'AT BAT' : isOnDeck ? 'on deck' : ''}
+                </Text>
+              )}
             </View>
           );
         })}
