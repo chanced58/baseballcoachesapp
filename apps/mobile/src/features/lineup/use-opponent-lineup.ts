@@ -11,6 +11,8 @@ export interface OpponentBatter {
   battingOrder: number;
   name: string;
   jerseyNumber?: string;
+  /** player_position enum value, e.g. 'first_base'. */
+  startingPosition?: string;
 }
 
 /**
@@ -85,6 +87,7 @@ export function useOpponentLineup(
             ? opponentDisplayName(player)
             : `Batter ${row.battingOrder}`,
           jerseyNumber: player?.jerseyNumber,
+          startingPosition: row.startingPosition ?? player?.primaryPosition,
         };
       })
       .sort((a, b) => a.battingOrder - b.battingOrder);

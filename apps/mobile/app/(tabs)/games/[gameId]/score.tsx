@@ -349,6 +349,7 @@ export default function ScoringScreen() {
   /** Whoever is actually at the plate right now, either side. */
   const currentPlateBatterId = weBat ? ourBatterId : opponentBatterId;
 
+
   // Our current pitcher, derived from the event stream so it persists across
   // innings — gameState.currentPitcherId is reset to null by INNING_CHANGE, so
   // relying on it would drop pitcher attribution (and pitch counts) from the
@@ -441,6 +442,40 @@ export default function ScoringScreen() {
     return () => { cancelled = true; };
   }, [battingSlots, nameById]);
   const batterName = (id: string) => nameById.get(id) ?? extraNames[id] ?? 'Unknown batter';
+
+  /**
+   * The batting team's order, whichever side that is — the card the scorer
+   * reads between pitches to see who is up, who follows, and who is due an
+   * inning from now. Positions come from the lineup row (a mid-game move is
+   * reflected) and fall back to the player's usual spot.
+   */
+  const battingOrderView = useMemo<BattingOrderRow[]>(() => {
+    if (!weBat) {
+      return opponentSlots.map((slot) => ({
+        playerId: slot.playerId,
+        battingOrder: slot.battingOrder,
+        name: slot.name,
+        position: slot.startingPosition ?? null,
+      }));
+    }
+    const positionByPlayer = new Map(
+      observedLineupRows.map((row) => [row.playerRemoteId, row.startingPosition ?? null]),
+    );
+    const rosterById = new Map(roster.map((p) => [p.id, p]));
+    return [...battingSlots]
+      .sort((a, b) => a.battingOrder - b.battingOrder)
+      .map((slot) => {
+        const player = rosterById.get(slot.playerId);
+        const name = batterName(slot.playerId);
+        return {
+          playerId: slot.playerId,
+          battingOrder: slot.battingOrder,
+          name: player?.jerseyNumber != null ? `#${player.jerseyNumber} ${name}` : name,
+          position:
+            positionByPlayer.get(slot.playerId) ?? player?.primaryPosition ?? null,
+        };
+      });
+  }, [weBat, opponentSlots, battingSlots, observedLineupRows, roster, nameById, extraNames]);
 
   const gameStarted = useMemo(
     () => events.some((e) => e.eventType === EventType.GAME_START),
@@ -1588,13 +1623,26 @@ export default function ScoringScreen() {
       {/* Next up — on deck while we bat, leading off our next half while the
           opponent does. Named for what it is in each case so the scorer
           doesn't have to work out which. */}
-      {/* An order of one wraps onto itself, so on-deck would just repeat the
-          batter at the plate — say nothing rather than something confusing. */}
-      {gameStarted && nextBatter && nextBatter.playerId !== currentPlateBatterId && (
+      {/* The batting team's order. On deck is marked inside the list, so the
+          separate on-deck line only appears when there is no order to show —
+          the opponent's book before anyone has been entered. */}
+      {gameStarted && battingOrderView.length > 0 && (
+        <BattingOrderCard
+          title={weBat ? `${teamName} batting order` : `${opponentName} batting order`}
+          rows={battingOrderView}
+          currentBatterId={currentPlateBatterId}
+          onDeckBatterId={
+            nextBatter && nextBatter.playerId !== currentPlateBatterId
+              ? nextBatter.playerId
+              : null
+          }
+          accent={weBat ? 'ours' : 'theirs'}
+        />
+      )}
+      {gameStarted && battingOrderView.length === 0 && nextBatter
+        && nextBatter.playerId !== currentPlateBatterId && (
         <View className="flex-row items-center px-4 py-2 border-t border-gray-100">
-          <Text className="text-xs text-gray-500 w-20">
-            {weBat || opponentSlots.length > 0 ? 'On deck' : 'Up next'}
-          </Text>
+          <Text className="text-xs text-gray-500 w-20">Up next</Text>
           <Text className="flex-1 text-sm text-gray-900" numberOfLines={1}>
             <Text className="font-semibold">{nextBatterName(nextBatter.playerId)}</Text>
             <Text className="text-xs text-gray-500">{'  '}slot {nextBatter.battingOrder}</Text>
@@ -1961,6 +2009,105 @@ function BatterPickerModal({
         </View>
       </View>
     </Modal>
+  );
+}
+
+interface BattingOrderRow {
+  playerId: string;
+  battingOrder: number;
+  name: string;
+  /** player_position enum value, or null when the slot has no position. */
+  position: string | null;
+}
+
+/** Scorecard abbreviations for the player_position enum. */
+const POSITION_ABBREV: Record<string, string> = {
+  pitcher: 'P',
+  catcher: 'C',
+  first_base: '1B',
+  second_base: '2B',
+  third_base: '3B',
+  shortstop: 'SS',
+  left_field: 'LF',
+  center_field: 'CF',
+  right_field: 'RF',
+  designated_hitter: 'DH',
+  infield: 'IF',
+  outfield: 'OF',
+  utility: 'UT',
+};
+
+/**
+ * The batting team's order, at a glance.
+ *
+ * A scorer tracks two things between pitches: who is up, and how far the
+ * order is from turning over. Both are position in a list, so the list is
+ * the display — the batter at the plate and the hitter on deck are marked
+ * in place rather than pulled out into separate readouts.
+ */
+function BattingOrderCard({
+  title,
+  rows,
+  currentBatterId,
+  onDeckBatterId,
+  accent,
+}: {
+  title: string;
+  rows: BattingOrderRow[];
+  currentBatterId: string | null;
+  onDeckBatterId: string | null;
+  accent: 'ours' | 'theirs';
+}) {
+  if (rows.length === 0) return null;
+  // Our half and theirs read as two different cards, so the eye can tell
+  // which book it is looking at without reading the header.
+  const atBatRow = accent === 'ours' ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-100 border-slate-300';
+  const atBatText = accent === 'ours' ? 'text-emerald-900' : 'text-slate-900';
+  const slotText = accent === 'ours' ? 'text-emerald-700' : 'text-slate-600';
+
+  return (
+    <View className="px-4 pt-2 pb-1 border-t border-gray-100">
+      <Text className="text-[11px] font-semibold text-gray-500 mb-0.5">{title}</Text>
+      {/* No row gap and tight padding: a ten-deep order has to fit the pane
+          without scrolling, or the scorer loses the bottom of the lineup at
+          exactly the moment the order turns over. */}
+      <View>
+        {rows.map((row) => {
+          const isAtBat = row.playerId === currentBatterId;
+          const isOnDeck = !isAtBat && row.playerId === onDeckBatterId;
+          return (
+            <View
+              key={`${row.battingOrder}-${row.playerId}`}
+              className={`flex-row items-center rounded-md px-2 py-0.5 border ${
+                isAtBat ? atBatRow : 'bg-transparent border-transparent'
+              }`}
+            >
+              <Text
+                className={`w-6 text-xs font-bold ${isAtBat ? slotText : 'text-gray-400'}`}
+              >
+                {row.battingOrder}
+              </Text>
+              <Text
+                className={`flex-1 text-[13px] ${
+                  isAtBat ? `font-bold ${atBatText}` : 'text-gray-800'
+                }`}
+                numberOfLines={1}
+              >
+                {row.name}
+              </Text>
+              {row.position && (
+                <Text className="w-8 text-[11px] text-gray-400 text-right">
+                  {POSITION_ABBREV[row.position] ?? ''}
+                </Text>
+              )}
+              <Text className={`w-16 text-[10px] font-semibold text-right ${slotText}`}>
+                {isAtBat ? 'AT BAT' : isOnDeck ? 'on deck' : ''}
+              </Text>
+            </View>
+          );
+        })}
+      </View>
+    </View>
   );
 }
 
