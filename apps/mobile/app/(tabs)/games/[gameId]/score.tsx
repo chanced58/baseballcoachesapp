@@ -1405,7 +1405,30 @@ export default function ScoringScreen() {
       />
 
       <PaneRow isWide={isWide}>
-      <StatePane isWide={isWide}>
+      <BookPane isWide={isWide}>
+
+      {/* Book toolbar. These were floating over the pane on absolute
+          positioning, which put them on top of the count once this column
+          started with it — they are ordinary controls, so they sit in the
+          flow like ordinary controls. */}
+      <View className="flex-row items-center gap-2 px-4 pt-2">
+        <TouchableOpacity
+          onPress={() =>
+            router.push({ pathname: '/(tabs)/games/[gameId]/lineup', params: { gameId } })
+          }
+          className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
+        >
+          <Text className="text-xs font-semibold text-gray-700">Full lineup</Text>
+        </TouchableOpacity>
+        {leagueSettings.guests.allowed && (
+          <TouchableOpacity
+            onPress={() => setShowGuestModal(true)}
+            className="px-3 py-1.5 rounded-full bg-emerald-100 border border-emerald-200"
+          >
+            <Text className="text-xs font-semibold text-emerald-800">+ Guest</Text>
+          </TouchableOpacity>
+        )}
+      </View>
 
       {/* League-rule advisories (mercy / run cap / regulation complete) */}
       {gameEndDecision && !gameState.isFinal && (
@@ -1483,31 +1506,6 @@ export default function ScoringScreen() {
         ) : null}
       </View>
 
-      {/* Game controls — manual half-inning switch (run cap, time limit,
-          corrections) and game completion */}
-      {gameStarted && !gameState.isFinal && gameState.outs < OUTS_PER_INNING && (
-        <View className="flex-row items-center gap-2 px-4 pt-2">
-          <TouchableOpacity
-            onPress={confirmInningChange}
-            className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
-          >
-            <Text className="text-xs font-semibold text-gray-700">End Inning ▸</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={confirmEndGame}
-            className={`px-3 py-1.5 rounded-full border ${
-              gameEndDecision
-                ? 'bg-amber-100 border-amber-300'
-                : 'bg-gray-100 border-gray-200'
-            }`}
-          >
-            <Text className={`text-xs font-semibold ${gameEndDecision ? 'text-amber-800' : 'text-gray-700'}`}>
-              End Game
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
       {/* Pre-game lineup prompt — visible until a starting pitcher is known */}
       {gameState.currentPitcherId === null && (
         <TouchableOpacity
@@ -1545,102 +1543,66 @@ export default function ScoringScreen() {
         onClose={() => setShowGuestModal(false)}
       />
 
-      {leagueSettings.guests.allowed && (
-        <TouchableOpacity
-          onPress={() => setShowGuestModal(true)}
-          className="absolute top-2 right-3 px-3 py-1.5 rounded-full bg-emerald-700/90"
-        >
-          <Text className="text-xs font-semibold text-white">+ Guest</Text>
-        </TouchableOpacity>
-      )}
-
-      <TouchableOpacity
-        onPress={() =>
-          router.push({
-            pathname: '/(tabs)/games/[gameId]/lineup',
-            params: { gameId },
-          })
-        }
-        className="absolute top-2 left-3 px-3 py-1.5 rounded-full bg-gray-700/90"
-      >
-        <Text className="text-xs font-semibold text-white">Lineup</Text>
-      </TouchableOpacity>
-
-      {/* Now batting — due-batter rotation with per-PA override */}
-      {gameStarted && (weBat ? (
-        <View className="flex-row items-center justify-between px-4 py-2 bg-emerald-50 border-t border-emerald-100">
-          <Text className="flex-1 text-sm text-emerald-900" numberOfLines={1}>
-            <Text className="text-xs text-emerald-700">Now batting{'  '}</Text>
-            <Text className="font-semibold">
-              {ourBatterId ? batterName(ourBatterId) : 'No batter set'}
-            </Text>
-            {batterOverrideId && batterOverrideId !== dueBatter?.playerId ? (
-              <Text className="text-xs text-amber-700">{'  '}(override)</Text>
-            ) : dueBatter && ourBatterId === dueBatter.playerId ? (
-              <Text className="text-xs text-emerald-700">{'  '}(slot {dueBatter.battingOrder})</Text>
-            ) : null}
-          </Text>
-          {battingSlots.length > 0 && (
-            <TouchableOpacity
-              onPress={() => setShowBatterPicker(true)}
-              className="ml-2 px-3 py-1 rounded-full bg-emerald-600"
-            >
-              <Text className="text-xs font-semibold text-white">Change</Text>
-            </TouchableOpacity>
-          )}
-          <TouchableOpacity
-            onPress={() => setShowAddOurBatter(true)}
-            className="ml-2 px-3 py-1 rounded-full bg-emerald-100"
-          >
-            <Text className="text-xs font-semibold text-emerald-800">+ Batter</Text>
-          </TouchableOpacity>
-        </View>
-      ) : (
-        <View className="flex-row items-center justify-between px-4 py-2 bg-slate-50 border-t border-slate-100">
-          <Text className="flex-1 text-sm text-slate-900" numberOfLines={1}>
-            <Text className="text-xs text-slate-600">{opponentName} batting{'  '}</Text>
-            <Text className="font-semibold">
-              {opponentBatterId
-                ? opponentNameById.get(opponentBatterId) ?? 'Unnamed batter'
-                : 'No batter set'}
-            </Text>
-            {opponentBatterOverrideId && opponentBatterOverrideId !== opponentDueBatter?.playerId ? (
-              <Text className="text-xs text-amber-700">{'  '}(override)</Text>
-            ) : opponentDueBatter && opponentBatterId === opponentDueBatter.playerId ? (
-              <Text className="text-xs text-slate-600">{'  '}(slot {opponentDueBatter.battingOrder})</Text>
-            ) : null}
-          </Text>
-          {opponentSlots.length > 0 && (
-            <TouchableOpacity
-              onPress={() => setShowOpponentBatterPicker(true)}
-              className="ml-2 px-3 py-1 rounded-full bg-slate-600"
-            >
-              <Text className="text-xs font-semibold text-white">Change</Text>
-            </TouchableOpacity>
-          )}
-          <TouchableOpacity
-            onPress={() => setShowAddOpponentBatter(true)}
-            className="ml-2 px-3 py-1 rounded-full bg-slate-200"
-          >
-            <Text className="text-xs font-semibold text-slate-700">+ Batter</Text>
-          </TouchableOpacity>
-        </View>
-      ))}
 
       {/* Next up — on deck while we bat, leading off our next half while the
           opponent does. Named for what it is in each case so the scorer
           doesn't have to work out which. */}
-      {/* On a tablet the order lives in its own rail down the left edge (see
-          the end of PaneRow) — stacked phone layouts have no room for a third
-          column, so it stays inline there. */}
-      {!isWide && gameStarted && battingOrderView.length > 0 && (
+      {gameStarted && battingOrderView.length > 0 && (
         <BattingOrderCard
           title={battingOrderTitle}
           rows={battingOrderView}
           currentBatterId={currentPlateBatterId}
           onDeckBatterId={onDeckBatterId}
           accent={weBat ? 'ours' : 'theirs'}
+          headerRight={
+            <View className="flex-row items-center gap-2">
+              {(weBat ? battingSlots.length > 0 : opponentSlots.length > 0) && (
+                <TouchableOpacity
+                  onPress={() =>
+                    weBat ? setShowBatterPicker(true) : setShowOpponentBatterPicker(true)
+                  }
+                  className={`px-3 py-1 rounded-full ${weBat ? 'bg-emerald-600' : 'bg-slate-600'}`}
+                >
+                  <Text className="text-xs font-semibold text-white">Change</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                onPress={() =>
+                  weBat ? setShowAddOurBatter(true) : setShowAddOpponentBatter(true)
+                }
+                className={`px-3 py-1 rounded-full ${weBat ? 'bg-emerald-100' : 'bg-slate-200'}`}
+              >
+                <Text
+                  className={`text-xs font-semibold ${weBat ? 'text-emerald-800' : 'text-slate-700'}`}
+                >
+                  + Batter
+                </Text>
+              </TouchableOpacity>
+            </View>
+          }
         />
+      )}
+      {/* An empty order still needs its Add control — the batter buttons live
+          in the card header, and the opponent's book starts empty, so without
+          this there is no way to enter the first one. */}
+      {gameStarted && battingOrderView.length === 0 && (
+        <View className="flex-row items-center px-4 py-2 border-t border-gray-100">
+          <Text className="flex-1 text-sm text-gray-500" numberOfLines={1}>
+            No {weBat ? 'batting order' : `${opponentName} order`} set
+          </Text>
+          <TouchableOpacity
+            onPress={() =>
+              weBat ? setShowAddOurBatter(true) : setShowAddOpponentBatter(true)
+            }
+            className={`px-3 py-1 rounded-full ${weBat ? 'bg-emerald-100' : 'bg-slate-200'}`}
+          >
+            <Text
+              className={`text-xs font-semibold ${weBat ? 'text-emerald-800' : 'text-slate-700'}`}
+            >
+              + Batter
+            </Text>
+          </TouchableOpacity>
+        </View>
       )}
       {gameStarted && battingOrderView.length === 0 && nextBatter
         && nextBatter.playerId !== currentPlateBatterId && (
@@ -1703,8 +1665,8 @@ export default function ScoringScreen() {
         onCancel={() => setShowAddOurBatter(false)}
       />
 
-      </StatePane>
-      <InputPane isWide={isWide}>
+      </BookPane>
+      <ActionPane isWide={isWide}>
 
       {gameStarted && (
         <PitchCountStrip
@@ -1808,19 +1770,30 @@ export default function ScoringScreen() {
       />
       )}
 
-      </InputPane>
-      {isWide && gameStarted && battingOrderView.length > 0 && (
-        <LineupRail>
-          <BattingOrderCard
-            title={battingOrderTitle}
-            rows={battingOrderView}
-            currentBatterId={currentPlateBatterId}
-            onDeckBatterId={onDeckBatterId}
-            accent={weBat ? 'ours' : 'theirs'}
-            rail
-          />
-        </LineupRail>
+      {/* Secondary actions sit under the input surface: reached a few times
+          a game, so they belong with the other taps but below the ones made
+          every pitch. */}
+      {gameStarted && !gameState.isFinal && gameState.outs < OUTS_PER_INNING && (
+        <View className="flex-row items-center gap-2 px-4 py-2 border-t border-gray-100">
+          <TouchableOpacity
+            onPress={confirmInningChange}
+            className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
+          >
+            <Text className="text-xs font-semibold text-gray-700">End Inning ▸</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={confirmEndGame}
+            className={`px-3 py-1.5 rounded-full border ${
+              gameEndDecision ? 'bg-amber-100 border-amber-300' : 'bg-gray-100 border-gray-200'
+            }`}
+          >
+            <Text className={`text-xs font-semibold ${gameEndDecision ? 'text-amber-800' : 'text-gray-700'}`}>
+              End Game
+            </Text>
+          </TouchableOpacity>
+        </View>
       )}
+      </ActionPane>
       </PaneRow>
     </View>
   );
@@ -1832,59 +1805,42 @@ export default function ScoringScreen() {
  * wrapping a block in JSX needs matched tags on both sides.
  */
 function PaneRow({ isWide, children }: { isWide: boolean; children: ReactNode }) {
-  // row-reverse puts the input surface on the left and the context pane on the
-  // right while leaving the JSX order alone — the two panes are contiguous
-  // blocks of a long render, so flipping them visually beats moving them.
   return (
-    <View
-      className={isWide ? 'flex-1' : 'flex-1'}
-      style={isWide ? { flexDirection: 'row-reverse' } : undefined}
-    >
+    <View className="flex-1" style={isWide ? { flexDirection: 'row' } : undefined}>
       {children}
     </View>
   );
 }
 
 /**
- * Count, baserunners, who's up — the context pane, on the right.
- */
-function StatePane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
-  if (!isWide) return <>{children}</>;
-  return (
-    <ScrollView
-      // Divider on the left: this pane sits on the right of the row.
-      className="border-l border-gray-200 bg-white"
-      // flex rather than a percentage width: a percentage on a ScrollView
-      // resolves against an ancestor that isn't the row here, and the pane
-      // ended up the wrong size. Equal flex splits the row down the middle
-      // however the parent is measured.
-      style={{ flex: 1 }}
-    >
-      {children}
-    </ScrollView>
-  );
-}
-
-/** The action surface — stays fixed so the buttons never scroll away. */
-function InputPane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
-  if (!isWide) return <>{children}</>;
-  return <View style={{ flex: 1 }}>{children}</View>;
-}
-
-/**
- * The batting order's own column, down the left edge.
+ * The book — everything the scorer READS: the count, the bases, the order.
  *
- * A lineup is a fixed, narrow list that the scorer glances at rather than
- * works in, so it wants a rail, not a share of the split. Given a fixed width
- * it costs the two working panes a strip instead of half of one, and both
- * keep an equal share of what is left.
+ * The screen had drifted into three columns with the same fact in two of
+ * them (who is at the plate was both a "Now batting" line and a highlighted
+ * lineup row). One reading column and one tapping column is fewer places to
+ * look, and it lets each fact live exactly once.
+ *
+ * The flex lives on a plain View and the ScrollView fills it. An uneven flex
+ * set directly on a ScrollView is not honoured — it collapses towards its
+ * content — which is why earlier splits only ever worked at 1:1.
  */
-function LineupRail({ children }: { children: ReactNode }) {
+function BookPane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
+  if (!isWide) return <>{children}</>;
   return (
-    <View className="border-r border-gray-200 bg-gray-50" style={{ width: 196 }}>
-      {children}
+    <View className="border-r border-gray-200 bg-white" style={{ flex: 5 }}>
+      <ScrollView style={{ flex: 1 }}>{children}</ScrollView>
     </View>
   );
+}
+
+/**
+ * The action surface — everything the scorer TAPS. Never scrolls, so the
+ * buttons are always where they were last time. Given the larger share:
+ * it is touched dozens of times an inning, the book is read.
+ */
+function ActionPane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
+  if (!isWide) return <>{children}</>;
+  return <View style={{ flex: 7 }}>{children}</View>;
 }
 
 /** Pitches / strikes / strike% for one line of the strip. */
@@ -2082,15 +2038,15 @@ function BattingOrderCard({
   currentBatterId,
   onDeckBatterId,
   accent,
-  rail = false,
+  headerRight,
 }: {
   title: string;
   rows: BattingOrderRow[];
   currentBatterId: string | null;
   onDeckBatterId: string | null;
   accent: 'ours' | 'theirs';
-  /** Rendered in the narrow left rail rather than inline in a pane. */
-  rail?: boolean;
+  /** Controls for the batter at the plate, shown beside the title. */
+  headerRight?: ReactNode;
 }) {
   if (rows.length === 0) return null;
   // Our half and theirs read as two different cards, so the eye can tell
@@ -2098,13 +2054,17 @@ function BattingOrderCard({
   const atBatRow = accent === 'ours' ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-100 border-slate-300';
   const atBatText = accent === 'ours' ? 'text-emerald-900' : 'text-slate-900';
   const slotText = accent === 'ours' ? 'text-emerald-700' : 'text-slate-600';
-  const markerColor = accent === 'ours' ? 'bg-emerald-500' : 'bg-slate-500';
-
   return (
-    <View className={rail ? 'px-2 pt-2 pb-1' : 'px-4 pt-2 pb-1 border-t border-gray-100'}>
-      <Text className="text-[11px] font-semibold text-gray-500 mb-0.5" numberOfLines={rail ? 2 : 1}>
-        {title}
-      </Text>
+    <View className="px-4 pt-2 pb-1 border-t border-gray-100">
+      <View className="flex-row items-center mb-1">
+        <Text
+          className="flex-1 text-[11px] font-semibold text-gray-500"
+          numberOfLines={1}
+        >
+          {title}
+        </Text>
+        {headerRight}
+      </View>
       {/* No row gap and tight padding: a ten-deep order has to fit the pane
           without scrolling, or the scorer loses the bottom of the lineup at
           exactly the moment the order turns over. */}
@@ -2120,9 +2080,7 @@ function BattingOrderCard({
               }`}
             >
               <Text
-                className={`${rail ? 'w-4' : 'w-6'} text-xs font-bold ${
-                  isAtBat ? slotText : 'text-gray-400'
-                }`}
+                className={`w-6 text-xs font-bold ${isAtBat ? slotText : 'text-gray-400'}`}
               >
                 {row.battingOrder}
               </Text>
@@ -2139,24 +2097,9 @@ function BattingOrderCard({
                   {POSITION_ABBREV[row.position] ?? ''}
                 </Text>
               )}
-              {/* "AT BAT" does not fit a 168pt rail beside a name, so the
-                  status becomes a mark at the edge: solid for the batter,
-                  hollow for on deck. Inline panes keep the words. */}
-              {rail ? (
-                <View className="w-3 items-end">
-                  {(isAtBat || isOnDeck) && (
-                    <View
-                      className={`w-1.5 h-1.5 rounded-full ${
-                        isAtBat ? markerColor : `border ${markerColor.replace('bg-', 'border-')}`
-                      }`}
-                    />
-                  )}
-                </View>
-              ) : (
-                <Text className={`w-16 text-[10px] font-semibold text-right ${slotText}`}>
-                  {isAtBat ? 'AT BAT' : isOnDeck ? 'on deck' : ''}
-                </Text>
-              )}
+              <Text className={`w-16 text-[10px] font-semibold text-right ${slotText}`}>
+                {isAtBat ? 'AT BAT' : isOnDeck ? 'on deck' : ''}
+              </Text>
             </View>
           );
         })}
