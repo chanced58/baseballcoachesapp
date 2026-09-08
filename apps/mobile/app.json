@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Baseball Coaches",
+    "name": "DiamondOS",
     "slug": "baseball-coaches-app",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -13,7 +13,15 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.baseballcoachesapp"
+      "bundleIdentifier": "com.baseballcoachesapp",
+      "infoPlist": {
+        "UISupportedInterfaceOrientations~ipad": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationPortraitUpsideDown",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
+        ]
+      }
     },
     "android": {
       "adaptiveIcon": {
