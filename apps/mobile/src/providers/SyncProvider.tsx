@@ -83,7 +83,21 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       setLastSyncError(null);
       setIsOffline(false);
     } catch (error) {
-      if (isConnectivityFailure(error)) {
+      // Ask the device before reading the message. The message alone is a
+      // poor classifier in both directions: a server-side statement timeout
+      // says "timeout" while the device is perfectly online, and a
+      // platform-specific offline error may not match the regex at all.
+      // NetInfo knows; fall back to the message only when it does not.
+      let offline: boolean;
+      try {
+        const state = await NetInfo.fetch();
+        const connected = state.isConnected && state.isInternetReachable;
+        offline = connected === null ? isConnectivityFailure(error) : !connected;
+      } catch {
+        offline = isConnectivityFailure(error);
+      }
+
+      if (offline) {
         // Expected while out of signal. Everything stays queued locally and
         // pushes on reconnect, so mark the state, don't raise an error.
         setIsOffline(true);
@@ -170,9 +184,13 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       // Reflect connectivity directly, so the scorer sees "offline" the moment
       // signal drops rather than only after a sync attempt has failed.
       setIsOffline(!isConnected);
-      if (isConnected) setLastSyncError(null);
 
+      // Only the offline -> online transition clears the error, and only
+      // because it is about to re-sync. Clearing on every connected callback
+      // discarded a genuine failure without starting a new attempt, leaving
+      // the scorer with no indicator and no retry.
       if (wasOfflineRef.current && isConnected) {
+        setLastSyncError(null);
         triggerSync();
       }
 

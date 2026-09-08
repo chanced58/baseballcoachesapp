@@ -3,6 +3,17 @@ import { View, Text, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform
 import { router } from 'expo-router';
 import { getSupabaseClient } from '../../src/lib/supabase';
 
+/**
+ * Input validation at the boundary, before either Supabase call.
+ *
+ * The OTP check asserts digits only and deliberately no length: these codes
+ * arrive as 8 digits even though the docs describe 6, so a length rule would
+ * reject valid codes. Digits-only still catches the common paste mistakes —
+ * a whole magic-link URL, or a code with stray whitespace.
+ */
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const OTP_PATTERN = /^\d+$/;
+
 export default function SignInScreen() {
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
@@ -14,12 +25,17 @@ export default function SignInScreen() {
   const supabase = getSupabaseClient();
 
   async function handleSignIn() {
-    if (!email.trim()) return;
+    const normalizedEmail = email.toLowerCase().trim();
+    if (!normalizedEmail) return;
+    if (!EMAIL_PATTERN.test(normalizedEmail)) {
+      setError('Enter a valid email address.');
+      return;
+    }
     setLoading(true);
     setError(null);
 
     const { error: signInError } = await supabase.auth.signInWithOtp({
-      email: email.toLowerCase().trim(),
+      email: normalizedEmail,
       options: {
         emailRedirectTo: 'baseballcoaches://auth-callback',
       },
@@ -34,13 +50,23 @@ export default function SignInScreen() {
   }
 
   async function handleVerifyCode() {
-    if (!code.trim()) return;
+    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedCode = code.trim();
+    if (!normalizedCode) return;
+    if (!EMAIL_PATTERN.test(normalizedEmail)) {
+      setError('Enter a valid email address.');
+      return;
+    }
+    if (!OTP_PATTERN.test(normalizedCode)) {
+      setError('The code is the number from the email — digits only.');
+      return;
+    }
     setVerifying(true);
     setError(null);
 
     const { error: verifyError } = await supabase.auth.verifyOtp({
-      email: email.toLowerCase().trim(),
-      token: code.trim(),
+      email: normalizedEmail,
+      token: normalizedCode,
       type: 'email',
     });
 

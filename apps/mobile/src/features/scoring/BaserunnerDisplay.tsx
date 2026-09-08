@@ -329,6 +329,10 @@ function BaseTap({
     <TouchableOpacity
       className={`absolute w-7 h-7 rotate-45 ${fill}`}
       style={style}
+      accessibilityRole="button"
+      // The visible label is a jersey number or initials, which on its own
+      // tells a screen-reader user nothing about which base it is.
+      accessibilityLabel={`Runner on ${baseLabel(base)}${label ? `, ${label}` : ''}`}
       onPress={() => onPress(base, runnerId)}
     >
       {content}

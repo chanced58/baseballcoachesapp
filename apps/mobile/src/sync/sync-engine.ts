@@ -1,6 +1,6 @@
 import { Q } from '@nozbe/watermelondb';
 import { synchronize, type SyncPullArgs, type SyncPushArgs } from '@nozbe/watermelondb/sync';
-import { computeLineupDeletes } from '@baseball/shared';
+import { computeLineupDeletes, PlayerPosition } from '@baseball/shared';
 import { database } from '../db';
 import type { GameEvent } from '../db/models/GameEvent';
 import type { GameLineup } from '../db/models/GameLineup';
@@ -11,16 +11,6 @@ import {
   getDirtyLineupState,
   pushLineupsForGame,
 } from './lineup-sync';
-
-/**
- * The Supabase player_position enum. Positions reach us as plain strings —
- * from a WatermelonDB text column, or typed by a scorer — so the upserts
- * below cast rather than pretending the value was validated upstream.
- */
-type PlayerPosition =
-  | 'pitcher' | 'catcher' | 'first_base' | 'second_base' | 'third_base'
-  | 'shortstop' | 'infield' | 'left_field' | 'center_field' | 'right_field'
-  | 'outfield' | 'designated_hitter' | 'utility';
 
 
 /**
@@ -61,7 +51,13 @@ export async function getQuarantinedEventIds(): Promise<string[]> {
   try {
     const raw = await database.localStorage.get<string>(QUARANTINED_EVENTS_KEY);
     return raw ? (JSON.parse(raw) as string[]) : [];
-  } catch {
+  } catch (err) {
+    // The dropped ids are the exact data this register exists to preserve,
+    // so losing them has to be visible rather than silently starting over.
+    console.warn(
+      `sync: quarantine register at ${QUARANTINED_EVENTS_KEY} is unreadable; starting empty`,
+      err,
+    );
     return [];
   }
 }

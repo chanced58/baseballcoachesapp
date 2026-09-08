@@ -1,5 +1,5 @@
 import { Model } from '@nozbe/watermelondb';
-import { field, children } from '@nozbe/watermelondb/decorators';
+import { field } from '@nozbe/watermelondb/decorators';
 import type { Associations } from '@nozbe/watermelondb/Model';
 
 export class Channel extends Model {

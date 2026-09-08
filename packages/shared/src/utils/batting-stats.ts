@@ -770,7 +770,12 @@ export function deriveBattingStats(
       if (etype === EventType.SCORE) {
         const scoringPlayerId: string | undefined = payload?.scoringPlayerId;
         if (!scoringPlayerId) continue;
-        scoreRunner(scoringPlayerId);
+        // deriveGameState mints an event-id stand-in to hold a base for a
+        // runner with no batter of record (see baserunnerIdentity). That
+        // identifies a runner, not a player, so crediting a run here would
+        // invent an 'Unknown' batting row no roster backs. The base
+        // bookkeeping below still runs — the runner did leave the base.
+        if (nameMap.has(scoringPlayerId)) scoreRunner(scoringPlayerId);
         // If a runner who was on 2nd or 3rd before the last out event
         // scores, the out was productive — credit QAB to the batter from
         // that PA. Check before clearing the scoring runner from bases so

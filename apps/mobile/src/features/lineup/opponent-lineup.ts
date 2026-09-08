@@ -117,7 +117,13 @@ export async function addNewOpponentBatter(args: {
 
   const first = firstName.trim();
   const last = lastName.trim();
-  if (!first && !last) return { ok: false, message: 'Enter a name or a jersey number.' };
+  const jersey = jerseyNumber?.trim() ?? '';
+  // A jersey number alone is enough — it is the common case at the field, and
+  // opponentDisplayName has a branch for exactly that. The guard used to
+  // ignore jerseyNumber and reject those entries.
+  if (!first && !last && !jersey) {
+    return { ok: false, message: 'Enter a name or a jersey number.' };
+  }
 
   let result: AddOpponentBatterResult = { ok: false, message: 'Could not add batter.' };
 
@@ -141,7 +147,7 @@ export async function addNewOpponentBatter(args: {
         // absent half becomes an empty string rather than blocking the add.
         r.firstName = first;
         r.lastName = last;
-        r.jerseyNumber = jerseyNumber?.trim() || undefined;
+        r.jerseyNumber = jersey || undefined;
         r.primaryPosition = startingPosition ?? undefined;
         r.isActive = true;
         r.updatedAt = Date.now();

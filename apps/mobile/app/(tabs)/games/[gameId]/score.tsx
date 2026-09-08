@@ -289,7 +289,8 @@ export default function ScoringScreen() {
     | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string }
   ): Promise<string | null> {
     if (input.kind === 'roster') {
-      await handleAddBatter(input.opponentPlayerId);
+      const message = await handleAddBatter(input.opponentPlayerId);
+      if (message) return message;
       setShowAddOurBatter(false);
       return null;
     }
@@ -1068,12 +1069,17 @@ export default function ScoringScreen() {
    * replay AND create a local game_lineups row so MaxPreps export, season
    * stats, and post-game queries pick the new batter up once it syncs.
    */
-  async function handleAddBatter(newBatterId: string) {
-    if (!gameState) return;
+  /**
+   * Returns null on success, or the reason it could not add the batter.
+   * The caller surfaces that: silently closing the modal made a full order
+   * look like a successful add.
+   */
+  async function handleAddBatter(newBatterId: string): Promise<string | null> {
+    if (!gameState) return 'The game is still loading.';
     // Don't add anyone until the lineup observation has fired — computing
     // currentMax=0 against an unloaded lineup would collide with the real
     // slot-1 occupant.
-    if (!lineupLoaded) return;
+    if (!lineupLoaded) return 'The lineup is still loading.';
 
     // Build the set of player ids already in the BATTING ORDER (bench rows
     // with a null order — e.g. a non-batting pitcher under DH rules — stay
@@ -1111,7 +1117,8 @@ export default function ScoringScreen() {
     // tighter. Bail before emitting an event that the persistence layer would
     // reject; the SUBSTITUTION would still land in the event log and diverge
     // replay from the DB state.
-    if (activePlayerIds.has(newBatterId) || currentMax >= maxBatters) return;
+    if (activePlayerIds.has(newBatterId)) return 'That player is already in the order.';
+    if (currentMax >= maxBatters) return `The order is full at ${maxBatters} batters.`;
 
     const battingOrderPosition = currentMax + 1;
 
@@ -1158,6 +1165,11 @@ export default function ScoringScreen() {
       );
     }
     triggerSync().catch(console.warn);
+    // The batter is in the order either way — the SUBSTITUTION event is the
+    // authoritative source for live play, and the mirror row is a
+    // convenience for post-game consumers. A failed mirror write is logged,
+    // not reported to the scorer as a failed add.
+    return null;
   }
 
   // Only scan this far back when searching for an event to void. Typical
@@ -2687,8 +2699,16 @@ function AddBatterModal({
   ) {
     if (busy) return;
     setBusy(true);
-    setError(await onSubmit(input));
-    setBusy(false);
+    try {
+      setError(await onSubmit(input));
+    } catch (err) {
+      // A rejected write would otherwise leave busy=true, disabling every
+      // button in the modal until it is closed and reopened.
+      console.warn(`AddBatterModal submit failed title=${title}:`, err);
+      setError('Could not add the batter. Try again.');
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (

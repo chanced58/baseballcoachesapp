@@ -53,7 +53,12 @@ function MessageThread({ messages, channel }: MessageThreadProps) {
           record.channelId = '';
           record.channelRemoteId = channel.remoteId;
           record.senderId = user.id;
-          record.senderName = user.email ?? 'You';
+          // Display-only until the pull replaces this row with the server
+          // version, which carries the real name from user_profiles. Writing
+          // the email here would keep an identifier in the local database for
+          // every message queued offline, and show it where every other
+          // message shows a name.
+          record.senderName = 'You';
           record.body = body;
           record.parentId = undefined;
           record.isPinned = false;

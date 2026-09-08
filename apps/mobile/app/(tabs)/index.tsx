@@ -76,10 +76,16 @@ function LiveGameCard({ game }: { game: Game }) {
   );
 }
 
-const LiveGames = withObservables([], () => ({
+// Scoped to one team: a device that has synced games for more than one team
+// would otherwise surface — and offer to resume — another team's live game.
+const LiveGames = withObservables(['teamId'], ({ teamId }: { teamId: string }) => ({
   games: database
     .get<Game>('games')
-    .query(Q.where('status', 'in_progress'), Q.sortBy('scheduled_at', Q.asc))
+    .query(
+      Q.where('status', 'in_progress'),
+      Q.where('team_id', teamId),
+      Q.sortBy('scheduled_at', Q.asc),
+    )
     .observe(),
 }))(({ games }: { games: Game[] }) => (
   <>
@@ -92,6 +98,7 @@ const LiveGames = withObservables([], () => ({
 export default function HomeScreen() {
   const { user, signOut } = useAuth();
   const { isSyncing } = useSyncContext();
+  const { activeTeam } = useRole();
 
   return (
     <ScrollView className="flex-1 bg-gray-50">
@@ -109,7 +116,7 @@ export default function HomeScreen() {
       <View className="px-5 space-y-3">
         {/* Renders nothing when no game is live, so the home screen keeps its
             usual shape the rest of the time. */}
-        <LiveGames />
+        {activeTeam && <LiveGames teamId={activeTeam.teamId} />}
 
         <TouchableOpacity
           className="bg-white rounded-xl border border-gray-200 p-5"
