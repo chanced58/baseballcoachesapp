@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, Modal } from 'react-native';
-import { useLocalSearchParams, Stack } from 'expo-router';
+import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { Q } from '@nozbe/watermelondb';
 import {
   DB_TO_POSITION,
@@ -30,6 +30,23 @@ interface Assignment {
 const EDITABLE_STATUSES = new Set(['scheduled', 'in_progress']);
 
 /**
+ * Back out of the lineup editor.
+ *
+ * score and lineup are sibling tab screens (see (tabs)/_layout.tsx), not a
+ * stack, so pushing between them switches tabs and leaves no back button —
+ * the editor was a dead end reachable only via the tab bar. This names its
+ * destination instead of relying on history, which also does the right thing
+ * when the page was opened from the games list rather than from scoring.
+ */
+function BackControl({ label, onPress }: { label: string; onPress: () => void }) {
+  return (
+    <TouchableOpacity onPress={onPress} className="pr-4 py-1" hitSlop={12}>
+      <Text className="text-white text-base font-semibold">‹ {label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+/**
  * Offline-first batting-order editor — the mobile counterpart of the web
  * LineupBuilder, with the same semantics: one batting slot + position per
  * roster player, benched pitchers kept with a null batting order (DH rule),
@@ -39,6 +56,7 @@ const EDITABLE_STATUSES = new Set(['scheduled', 'in_progress']);
  */
 export default function LineupScreen() {
   const { gameId } = useLocalSearchParams<{ gameId: string }>();
+  const router = useRouter();
   const { triggerSync, isSyncing, lastSyncError } = useSyncContext();
 
   // Resolve the game from the local DB — the route only carries the game id.
@@ -282,7 +300,18 @@ export default function LineupScreen() {
   if (!game) {
     return (
       <View className="flex-1 items-center justify-center bg-white px-6">
-        <Stack.Screen options={{ title: 'Lineup', headerShown: true }} />
+        <Stack.Screen
+          options={{
+            title: 'Lineup',
+            headerShown: true,
+            headerLeft: () => (
+              <BackControl
+                label="Games"
+                onPress={() => router.replace('/(tabs)/games')}
+              />
+            ),
+          }}
+        />
         <Text className="text-gray-500 text-center">
           This game hasn't synced to this device yet. Connect to the internet
           and pull to refresh the games list.
@@ -296,7 +325,24 @@ export default function LineupScreen() {
   return (
     <View className="flex-1 bg-white">
       <Stack.Screen
-        options={{ title: `Lineup vs ${game.opponentName || 'TBD'}`, headerShown: true }}
+        options={{
+          title: `Lineup vs ${game.opponentName || 'TBD'}`,
+          headerShown: true,
+          headerLeft: () =>
+            game.status === 'in_progress' ? (
+              <BackControl
+                label="Scoring"
+                onPress={() =>
+                  router.replace({
+                    pathname: '/(tabs)/games/[gameId]/score',
+                    params: { gameId },
+                  })
+                }
+              />
+            ) : (
+              <BackControl label="Games" onPress={() => router.replace('/(tabs)/games')} />
+            ),
+        }}
       />
 
       {!editable && (
