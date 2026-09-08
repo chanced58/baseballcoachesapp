@@ -20,7 +20,7 @@ import { GuestPlayerModal } from '../../../../src/features/scoring/GuestPlayerMo
 import { useDefensiveLineup } from '../../../../src/features/scoring/use-defensive-lineup';
 import { LoadingSpinner } from '@baseball/ui';
 import { Q } from '@nozbe/watermelondb';
-import { EventType, PitchOutcome, HitType, HitTrajectory, AdvanceReason, type PitchType, weAreHome, getMaxBattingOrder, isMidGameExtensionAllowed, isDroppedThirdStrikeAllowed, evaluateGameEnd, shouldEndHalfForRunCap, ghostRunnerBaseForHalf, applyLineupSubstitutions, deriveDueBatter, attributePlayersForHalf, OUTS_PER_INNING, getPitchComplianceStatus } from '@baseball/shared';
+import { EventType, PitchOutcome, HitType, HitTrajectory, AdvanceReason, type PitchType, weAreHome, getMaxBattingOrder, isMidGameExtensionAllowed, isDroppedThirdStrikeAllowed, evaluateGameEnd, shouldEndHalfForRunCap, ghostRunnerBaseForHalf, applyLineupSubstitutions, deriveDueBatter, attributePlayersForHalf, OUTS_PER_INNING, getPitchComplianceStatus, FIELDING_POSITION_NUMBERS, formatFieldingSequence } from '@baseball/shared';
 import type { PitchThrownPayload, HitPayload, OutPayload, DroppedThirdStrikePayload, DroppedThirdStrikeOutcome, BaserunnerMovePayload, PickoffPayload, ScorePayload, EventVoidedPayload, SubstitutionPayload, PitchingChangePayload, BattingSlot, HalfAttribution } from '@baseball/shared';
 import { SubstitutionType } from '@baseball/shared';
 import { useLeagueContext } from '../../../../src/lib/league-settings';
@@ -234,6 +234,8 @@ export default function ScoringScreen() {
   const [showOpponentBatterPicker, setShowOpponentBatterPicker] = useState(false);
   const [showAddOpponentBatter, setShowAddOpponentBatter] = useState(false);
   const [showAddOurBatter, setShowAddOurBatter] = useState(false);
+  const [caughtStealingFor, setCaughtStealingFor] =
+    useState<{ base: 1 | 2 | 3; runnerId: string; name: string } | null>(null);
 
   /**
    * Add someone to the opposing order mid-game, either from their known
@@ -776,11 +778,35 @@ export default function ScoringScreen() {
     }
   }
 
-  async function handleCaughtStealing(fromBase: 1 | 2 | 3, runnerId: string) {
+  /**
+   * Opens the fielding-sequence prompt rather than recording immediately.
+   *
+   * A caught stealing is a putout and is scored like one — 2-6, 2-4, 2-5 —
+   * and the sequence is what a coach reads back later to see how the play
+   * went. Both entry points (the runners panel and the base-tap sheet) come
+   * through here, so the two cannot drift apart.
+   */
+  function handleCaughtStealing(fromBase: 1 | 2 | 3, runnerId: string) {
+    setCaughtStealingFor({ base: fromBase, runnerId, name: runnerName(runnerId) });
+  }
+
+  async function recordCaughtStealing(
+    fromBase: 1 | 2 | 3,
+    runnerId: string,
+    fieldingSequence: number[],
+  ) {
     if (!gameState) return;
     const toBase = (fromBase + 1) as 2 | 3 | 4;
-    const payload: BaserunnerMovePayload = { runnerId, fromBase, toBase };
+    const payload: BaserunnerMovePayload = {
+      runnerId,
+      fromBase,
+      toBase,
+      // Omitted rather than sent empty when the scorer skipped it: an absent
+      // sequence means "not recorded", which an empty array would blur.
+      ...(fieldingSequence.length > 0 ? { fieldingSequence } : {}),
+    };
     await recordEvent(EventType.CAUGHT_STEALING, gameState.inning, gameState.isTopOfInning, payload);
+    setCaughtStealingFor(null);
   }
 
   async function advanceAllRunnersOneBase(reason: AdvanceReason) {
@@ -1743,6 +1769,20 @@ export default function ScoringScreen() {
         onCancel={() => setShowAddOpponentBatter(false)}
       />
 
+      <CaughtStealingModal
+        runner={caughtStealingFor}
+        onRecord={(sequence) => {
+          if (caughtStealingFor) {
+            recordCaughtStealing(
+              caughtStealingFor.base,
+              caughtStealingFor.runnerId,
+              sequence,
+            ).catch(console.warn);
+          }
+        }}
+        onCancel={() => setCaughtStealingFor(null)}
+      />
+
       <AddBatterModal
         visible={showAddOurBatter}
         title="Add batter"
@@ -2204,6 +2244,131 @@ function RunnersPanel({
         onCancel={() => setPickoffFor(null)}
       />
     </View>
+  );
+}
+
+/**
+ * Standard notations for a caught stealing, by the base being stolen.
+ * Offered as one tap because they cover nearly every one that happens; the
+ * grid underneath handles the rest.
+ */
+const CS_PRESETS: Record<1 | 2 | 3, { seq: number[]; hint: string }[]> = {
+  1: [
+    { seq: [2, 4], hint: 'C to 2B' },
+    { seq: [2, 6], hint: 'C to SS' },
+  ],
+  2: [
+    { seq: [2, 5], hint: 'C to 3B' },
+    { seq: [2, 6], hint: 'C to SS' },
+  ],
+  3: [
+    { seq: [2], hint: 'C unassisted' },
+    { seq: [1, 2], hint: 'P to C' },
+  ],
+};
+
+const STOLEN_BASE_LABEL: Record<1 | 2 | 3, string> = { 1: '2nd', 2: '3rd', 3: 'home' };
+
+/**
+ * How the caught stealing was turned — 2-6, 2-4, 2-5.
+ *
+ * The sequence is optional: a scorer who only saw the out should not be
+ * blocked from recording it, and an absent sequence reads as "not recorded"
+ * rather than as a claim about the play.
+ */
+function CaughtStealingModal({
+  runner,
+  onRecord,
+  onCancel,
+}: {
+  runner: { base: 1 | 2 | 3; runnerId: string; name: string } | null;
+  onRecord: (sequence: number[]) => void;
+  onCancel: () => void;
+}) {
+  const [sequence, setSequence] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (runner) setSequence([]);
+  }, [runner]);
+
+  if (!runner) return null;
+  const presets = CS_PRESETS[runner.base];
+
+  return (
+    <Modal visible transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '90%' }}>
+          <Text className="text-lg font-bold text-gray-900 mb-1">
+            Caught stealing {STOLEN_BASE_LABEL[runner.base]}
+          </Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            {runner.name} — who made the play?
+          </Text>
+
+          <View className="flex-row items-center mb-4">
+            <Text className="text-xs text-gray-500 w-16">Sequence</Text>
+            <Text className="flex-1 text-2xl font-bold text-gray-900">
+              {sequence.length > 0 ? formatFieldingSequence(sequence) : '—'}
+            </Text>
+            {sequence.length > 0 && (
+              <TouchableOpacity
+                onPress={() => setSequence((prev) => prev.slice(0, -1))}
+                className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
+              >
+                <Text className="text-xs font-semibold text-gray-700">Undo</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          <ScrollView style={{ maxHeight: 400 }}>
+            <Text className="text-[11px] font-semibold text-gray-500 mb-2">COMMON</Text>
+            <View className="flex-row gap-2 mb-5">
+              {presets.map((preset) => (
+                <TouchableOpacity
+                  key={preset.seq.join('-')}
+                  onPress={() => setSequence(preset.seq)}
+                  className="px-4 py-2.5 rounded-xl bg-white border border-sky-300"
+                >
+                  <Text className="text-base font-bold text-sky-900">
+                    {formatFieldingSequence(preset.seq)}
+                  </Text>
+                  <Text className="text-[11px] text-gray-500">{preset.hint}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text className="text-[11px] font-semibold text-gray-500 mb-2">
+              OR TAP FIELDERS IN ORDER
+            </Text>
+            <View className="flex-row flex-wrap gap-2">
+              {FIELDING_POSITION_NUMBERS.map((pos) => (
+                <TouchableOpacity
+                  key={pos.number}
+                  onPress={() => setSequence((prev) => [...prev, pos.number])}
+                  className="rounded-xl bg-white border border-gray-300 px-3 py-2.5 items-center"
+                  style={{ width: 84 }}
+                >
+                  <Text className="text-base font-bold text-gray-900">{pos.number}</Text>
+                  <Text className="text-[11px] text-gray-500">{pos.abbr}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+
+          <TouchableOpacity
+            onPress={() => onRecord(sequence)}
+            className="mt-5 rounded-xl py-4 items-center bg-rose-600"
+          >
+            <Text className="text-white font-bold text-base">
+              Record out{sequence.length > 0 ? ` — ${formatFieldingSequence(sequence)}` : ''}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity className="mt-2 py-3 items-center" onPress={onCancel}>
+            <Text className="text-gray-500 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
