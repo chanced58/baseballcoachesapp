@@ -1229,14 +1229,61 @@ export default function ScoringScreen() {
   }
 
   async function handlePickoffOut(fromBase: 1 | 2 | 3, runnerId: string) {
+    await handlePickoff(fromBase, runnerId, 'out');
+  }
+
+  /**
+   * A pickoff throw has three results worth recording, and only one of them
+   * retires the runner.
+   *
+   * 'error' is written as a safe pickoff plus a linked BASERUNNER_ADVANCE
+   * rather than a new PickoffPayload outcome. The runner genuinely was safe —
+   * the throw did not retire him — and the advance then runs through the
+   * same path as every other error advance, including scoring from third.
+   * Five separate consumers branch on a pickoff's outcome (the engine, the
+   * line score, pitching stats, the history tree and the live ticker); a new
+   * value there would have to be taught to all of them, and any one missed
+   * would put the derived state quietly out of step with the engine.
+   */
+  async function handlePickoff(
+    fromBase: 1 | 2 | 3,
+    runnerId: string,
+    outcome: 'safe' | 'out' | 'error',
+  ) {
     if (!gameState) return;
     const payload: PickoffPayload = {
       runnerId,
       base: fromBase,
       ...pitcherAttribution,
-      outcome: 'out',
+      outcome: outcome === 'out' ? 'out' : 'safe',
     };
-    await recordEvent(EventType.PICKOFF_ATTEMPT, gameState.inning, gameState.isTopOfInning, payload);
+    const pickoffEventId = await recordEvent(
+      EventType.PICKOFF_ATTEMPT,
+      gameState.inning,
+      gameState.isTopOfInning,
+      payload,
+    );
+
+    if (outcome !== 'error') return;
+
+    const toBase = (fromBase + 1) as 2 | 3 | 4;
+    const advance: BaserunnerMovePayload = {
+      runnerId,
+      fromBase,
+      toBase,
+      reason: AdvanceReason.ERROR,
+      relatedEventId: pickoffEventId,
+    };
+    await recordEvent(
+      EventType.BASERUNNER_ADVANCE,
+      gameState.inning,
+      gameState.isTopOfInning,
+      advance,
+    );
+    if (toBase === 4) {
+      const scorePayload: ScorePayload = { scoringPlayerId: runnerId, rbis: 0 };
+      await recordEvent(EventType.SCORE, gameState.inning, gameState.isTopOfInning, scorePayload);
+    }
   }
 
   async function handleBalk() {
@@ -1548,8 +1595,11 @@ export default function ScoringScreen() {
         ) : null}
       </View>
 
-      {/* Pre-game lineup prompt — visible until a starting pitcher is known */}
-      {gameState.currentPitcherId === null && (
+      {/* Pre-game lineup prompt. Keyed off ourPitcherId, not
+          gameState.currentPitcherId: INNING_CHANGE resets the latter to null,
+          so this used to reappear at the top of every half-inning of a game
+          that had been under way for an hour. */}
+      {ourPitcherId === null && (
         <TouchableOpacity
           className="mx-4 mt-2 p-3 bg-amber-50 border border-amber-300 rounded-lg flex-row items-center"
           onPress={() => setShowLineupModal(true)}
@@ -1716,7 +1766,7 @@ export default function ScoringScreen() {
           onSteal={handleStolenBase}
           onCaught={handleCaughtStealing}
           onAdvance={handleRunnerAdvance}
-          onPickoff={handlePickoffOut}
+          onPickoff={handlePickoff}
         />
       )}
 
@@ -2099,8 +2149,10 @@ function RunnersPanel({
   onSteal: (base: 1 | 2 | 3, runnerId: string) => void;
   onCaught: (base: 1 | 2 | 3, runnerId: string) => void;
   onAdvance: (base: 1 | 2 | 3, runnerId: string, reason: AdvanceReason) => void;
-  onPickoff: (base: 1 | 2 | 3, runnerId: string) => void;
+  onPickoff: (base: 1 | 2 | 3, runnerId: string, outcome: PickoffOutcome) => void;
 }) {
+  const [pickoffFor, setPickoffFor] =
+    useState<{ base: 1 | 2 | 3; runnerId: string; name: string } | null>(null);
   if (runners.length === 0) return null;
   return (
     <View className="px-4 py-2 border-b border-gray-200 bg-white">
@@ -2137,12 +2189,107 @@ function RunnersPanel({
             <RunnerAction
               label="Pickoff"
               tone="bg-slate-100 border-slate-300"
-              onPress={() => onPickoff(r.base, r.runnerId)}
+              onPress={() => setPickoffFor(r)}
             />
           </View>
         ))}
       </View>
+
+      <PickoffOutcomeModal
+        runner={pickoffFor}
+        onPick={(outcome) => {
+          if (pickoffFor) onPickoff(pickoffFor.base, pickoffFor.runnerId, outcome);
+          setPickoffFor(null);
+        }}
+        onCancel={() => setPickoffFor(null)}
+      />
     </View>
+  );
+}
+
+export type PickoffOutcome = 'safe' | 'out' | 'error';
+
+/**
+ * How the pickoff throw ended. Three results, and only one retires the
+ * runner — a throw that gets away moves him up instead, which is the
+ * opposite outcome and was previously unrecordable.
+ */
+function PickoffOutcomeModal({
+  runner,
+  onPick,
+  onCancel,
+}: {
+  runner: { base: 1 | 2 | 3; runnerId: string; name: string } | null;
+  onPick: (outcome: PickoffOutcome) => void;
+  onCancel: () => void;
+}) {
+  // Only meaningful from 1st or 2nd; a runner on 3rd scores, handled below.
+  const nextBase =
+    runner && runner.base < 3 ? BASE_ABBREV[(runner.base + 1) as 2 | 3] : '';
+  return (
+    <Modal visible={!!runner} transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5">
+          <Text className="text-lg font-bold text-gray-900 mb-1">
+            Pickoff at {runner ? BASE_ABBREV[runner.base] : ''}
+          </Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            {runner ? runner.name : ''} — how did the throw end?
+          </Text>
+          <View className="gap-3">
+            <PickoffChoice
+              label="Safe"
+              sub="Runner gets back. Nothing changes."
+              tone="bg-white border-slate-300"
+              textTone="text-slate-800"
+              onPress={() => onPick('safe')}
+            />
+            <PickoffChoice
+              label="Out"
+              sub="Runner is picked off."
+              tone="bg-white border-rose-300"
+              textTone="text-rose-800"
+              onPress={() => onPick('out')}
+            />
+            <PickoffChoice
+              label="Attempted, error"
+              sub={
+                runner?.base === 3
+                  ? 'Throw gets away. Runner scores, charged as an error.'
+                  : `Throw gets away. Runner takes ${nextBase}, charged as an error.`
+              }
+              tone="bg-white border-amber-300"
+              textTone="text-amber-800"
+              onPress={() => onPick('error')}
+            />
+          </View>
+          <TouchableOpacity className="mt-4 py-3 items-center" onPress={onCancel}>
+            <Text className="text-gray-500 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function PickoffChoice({
+  label,
+  sub,
+  tone,
+  textTone,
+  onPress,
+}: {
+  label: string;
+  sub: string;
+  tone: string;
+  textTone: string;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity className={`rounded-xl border px-5 py-4 ${tone}`} onPress={onPress}>
+      <Text className={`font-semibold text-base ${textTone}`}>{label}</Text>
+      <Text className="text-gray-500 text-xs mt-0.5">{sub}</Text>
+    </TouchableOpacity>
   );
 }
 
