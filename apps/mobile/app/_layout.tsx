@@ -31,14 +31,6 @@ function RootLayoutNav() {
     <Stack screenOptions={{ headerShown: false }}>
       <Stack.Screen name="(auth)" />
       <Stack.Screen name="(tabs)" />
-      <Stack.Screen
-        name="(modals)/lineup-editor"
-        options={{ presentation: 'modal', headerShown: true, title: 'Set Lineup' }}
-      />
-      <Stack.Screen
-        name="(modals)/substitution"
-        options={{ presentation: 'modal', headerShown: true, title: 'Substitution' }}
-      />
     </Stack>
   );
 }

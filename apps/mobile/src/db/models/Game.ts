@@ -1,4 +1,5 @@
-import { Model, field, children } from '@nozbe/watermelondb';
+import { Model } from '@nozbe/watermelondb';
+import { field, children } from '@nozbe/watermelondb/decorators';
 import type { Associations } from '@nozbe/watermelondb/Model';
 import type { GameEvent } from './GameEvent';
 
@@ -13,6 +14,8 @@ export class Game extends Model {
   @field('season_id') seasonId!: string;
   @field('team_id') teamId!: string;
   @field('opponent_name') opponentName!: string;
+  /** Set when the opponent is a tracked opponent_teams row — the key to their roster. */
+  @field('opponent_team_id') opponentTeamId!: string | undefined;
   @field('scheduled_at') scheduledAt!: number;
   @field('location_type') locationType!: string;
   @field('neutral_home_team') neutralHomeTeam!: string | undefined;

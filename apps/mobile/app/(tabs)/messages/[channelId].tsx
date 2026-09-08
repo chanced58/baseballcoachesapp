@@ -4,13 +4,12 @@ import { useState, useRef } from 'react';
 import { randomUUID } from 'expo-crypto';
 import { map } from 'rxjs';
 import { Q } from '@nozbe/watermelondb';
-import { withObservables } from '@nozbe/with-observables';
+import withObservables from '@nozbe/with-observables';
 import { database } from '../../../src/db';
 import type { Message } from '../../../src/db/models/Message';
 import type { Channel } from '../../../src/db/models/Channel';
 import { useAuth } from '../../../src/providers/AuthProvider';
 import { getSupabaseClient } from '../../../src/lib/supabase';
-import { database } from '../../../src/db';
 import { formatTime } from '@baseball/shared';
 
 interface MessageThreadProps {
@@ -44,17 +43,27 @@ function MessageThread({ messages, channel }: MessageThreadProps) {
     } catch (err) {
       console.warn('Message send failed; queueing offline message', err);
       await database.write(async () => {
-        await database.get('messages').create((record: Record<string, unknown>) => {
-          record.remote_id = randomUUID();
-          record.channel_id = '';
-          record.channel_remote_id = channel.remoteId;
-          record.sender_id = user.id;
-          record.sender_name = user.email ?? 'You';
+        // Assign the decorated (camelCase) properties — raw column names set
+        // on a Model are silently discarded and the queued row would be
+        // written blank. See the note in use-record-event.ts.
+        await database.get<Message>('messages').create((record: Message) => {
+          const messageId = randomUUID();
+          record._raw.id = messageId;
+          record.remoteId = messageId;
+          record.channelId = '';
+          record.channelRemoteId = channel.remoteId;
+          record.senderId = user.id;
+          // Display-only until the pull replaces this row with the server
+          // version, which carries the real name from user_profiles. Writing
+          // the email here would keep an identifier in the local database for
+          // every message queued offline, and show it where every other
+          // message shows a name.
+          record.senderName = 'You';
           record.body = body;
-          record.parent_id = null;
-          record.is_pinned = false;
-          record.created_at = Date.now();
-          record.synced_at = null;
+          record.parentId = undefined;
+          record.isPinned = false;
+          record.createdAt = Date.now();
+          record.syncedAt = undefined;
         });
       });
       setText('');

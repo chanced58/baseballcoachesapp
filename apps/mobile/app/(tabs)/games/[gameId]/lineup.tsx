@@ -29,14 +29,6 @@ interface Assignment {
 
 const EDITABLE_STATUSES = new Set(['scheduled', 'in_progress']);
 
-/**
- * Offline-first batting-order editor — the mobile counterpart of the web
- * LineupBuilder, with the same semantics: one batting slot + position per
- * roster player, benched pitchers kept with a null batting order (DH rule),
- * guests managed individually below the main order. All writes land in
- * WatermelonDB and sync to Supabase in the background (mobile wins for live
- * games, last-write-wins before first pitch).
- */
 export default function LineupScreen() {
   const { gameId } = useLocalSearchParams<{ gameId: string }>();
   const { triggerSync, isSyncing, lastSyncError } = useSyncContext();

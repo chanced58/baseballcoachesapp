@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { View, Text, FlatList, TouchableOpacity } from 'react-native';
 import { router } from 'expo-router';
 import { Q } from '@nozbe/watermelondb';
-import { withObservables } from '@nozbe/with-observables';
+import withObservables from '@nozbe/with-observables';
 import { database } from '../../../src/db';
 import type { Game } from '../../../src/db/models/Game';
 import { formatDate, formatTime, type GameRsvpStatus } from '@baseball/shared';

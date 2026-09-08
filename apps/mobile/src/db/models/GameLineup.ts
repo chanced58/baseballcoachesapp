@@ -1,4 +1,5 @@
-import { Model, field } from '@nozbe/watermelondb';
+import { Model } from '@nozbe/watermelondb';
+import { field } from '@nozbe/watermelondb/decorators';
 
 /**
  * Local mirror of a game_lineups row. Mutable and synced both ways:

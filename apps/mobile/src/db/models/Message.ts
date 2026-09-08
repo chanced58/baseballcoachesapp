@@ -1,4 +1,5 @@
-import { Model, field, relation } from '@nozbe/watermelondb';
+import { Model } from '@nozbe/watermelondb';
+import { field } from '@nozbe/watermelondb/decorators';
 import type { Associations } from '@nozbe/watermelondb/Model';
 
 export class Message extends Model {

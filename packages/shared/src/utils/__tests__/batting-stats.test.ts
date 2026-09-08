@@ -517,3 +517,35 @@ describe('deriveBattingStats — DROPPED_THIRD_STRIKE', () => {
     expect(s.hits).toBe(0);
   });
 });
+
+describe('deriveBattingStats — SCORE from an unrecognized runner', () => {
+  beforeEach(resetSeq);
+
+  // deriveGameState mints an event-id stand-in to hold a base when a runner
+  // has no batter of record (an opponent half scored without their order
+  // entered). A SCORE naming that stand-in must not manufacture a batting row
+  // for it: the id is a runner handle, not a player.
+  it('does not create a stats row for an event-id stand-in', () => {
+    const standIn = 'evt-9f3c1b2a-not-a-player';
+    const stats = deriveBattingStats(
+      [
+        e(EventType.SCORE, { scoringPlayerId: standIn }),
+      ] as never,
+      players,
+    );
+
+    expect(stats.has(standIn)).toBe(false);
+    expect([...stats.values()].some((s) => s.playerName === 'Unknown')).toBe(false);
+  });
+
+  it('still credits a run to a runner the roster knows', () => {
+    const stats = deriveBattingStats(
+      [
+        e(EventType.SCORE, { scoringPlayerId: 'p1' }),
+      ] as never,
+      players,
+    );
+
+    expect(stats.get('p1')?.runs).toBe(1);
+  });
+});

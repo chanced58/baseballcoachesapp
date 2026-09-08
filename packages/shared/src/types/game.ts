@@ -111,4 +111,11 @@ export interface LiveGameState {
   isFinal: boolean;
   /** Cumulative pitch totals per pitcher id (platform + opponent ids as recorded). */
   pitcherPitchCounts: Record<string, number>;
+  /**
+   * Cumulative strikes thrown per pitcher id, scored the conventional way:
+   * every pitch that is not a ball, an intentional ball, or a hit batsman —
+   * so called and swinging strikes, fouls, foul tips, and balls put in play
+   * all count. Pairs with pitcherPitchCounts to give strike percentage.
+   */
+  pitcherStrikeCounts: Record<string, number>;
 }

@@ -1,5 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
-import { View, Text, TouchableOpacity, Modal, ScrollView, Alert } from 'react-native';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  Modal,
+  ScrollView,
+  Alert,
+  TextInput,
+  useWindowDimensions,
+} from 'react-native';
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { useGameState } from '../../../../src/features/scoring/use-game-state';
 import { useRecordEvent } from '../../../../src/features/scoring/use-record-event';
@@ -11,7 +20,7 @@ import { GuestPlayerModal } from '../../../../src/features/scoring/GuestPlayerMo
 import { useDefensiveLineup } from '../../../../src/features/scoring/use-defensive-lineup';
 import { LoadingSpinner } from '@baseball/ui';
 import { Q } from '@nozbe/watermelondb';
-import { EventType, PitchOutcome, HitType, HitTrajectory, AdvanceReason, type PitchType, weAreHome, getMaxBattingOrder, isMidGameExtensionAllowed, isDroppedThirdStrikeAllowed, evaluateGameEnd, shouldEndHalfForRunCap, ghostRunnerBaseForHalf, applyLineupSubstitutions, deriveDueBatter, attributePlayersForHalf, OUTS_PER_INNING, getPitchComplianceStatus } from '@baseball/shared';
+import { EventType, PitchOutcome, HitType, HitTrajectory, AdvanceReason, type PitchType, weAreHome, getMaxBattingOrder, isMidGameExtensionAllowed, isDroppedThirdStrikeAllowed, evaluateGameEnd, shouldEndHalfForRunCap, ghostRunnerBaseForHalf, applyLineupSubstitutions, deriveDueBatter, attributePlayersForHalf, OUTS_PER_INNING, getPitchComplianceStatus, FIELDING_POSITION_NUMBERS, formatFieldingSequence } from '@baseball/shared';
 import type { PitchThrownPayload, HitPayload, OutPayload, DroppedThirdStrikePayload, DroppedThirdStrikeOutcome, BaserunnerMovePayload, PickoffPayload, ScorePayload, EventVoidedPayload, SubstitutionPayload, PitchingChangePayload, BattingSlot, HalfAttribution } from '@baseball/shared';
 import { SubstitutionType } from '@baseball/shared';
 import { useLeagueContext } from '../../../../src/lib/league-settings';
@@ -21,8 +30,14 @@ import type { Game } from '../../../../src/db/models/Game';
 import type { Player } from '../../../../src/db/models/Player';
 import type { BattedOutType, RosterPlayer, RunnerOutcome } from '../../../../src/features/scoring/PitchInput';
 import { useSyncContext } from '../../../../src/providers/SyncProvider';
-import { addLineupRow } from '../../../../src/features/lineup/local-guest';
+import { addLineupRow, createLocalGuest } from '../../../../src/features/lineup/local-guest';
 import { useGameLineups } from '../../../../src/features/lineup/use-game-lineups';
+import { useOpponentLineup, type OpponentBatter } from '../../../../src/features/lineup/use-opponent-lineup';
+import {
+  addNewOpponentBatter,
+  addOpponentBatterFromRoster,
+  opponentDisplayName,
+} from '../../../../src/features/lineup/opponent-lineup';
 
 /**
  * Live game scoring screen — the core feature of the mobile app.
@@ -67,9 +82,16 @@ export default function ScoringScreen() {
   const homeLabel = isHome ? (teamName as string) : (opponentName as string);
   const awayLabel = isHome ? (opponentName as string) : (teamName as string);
 
+  // Tablet-width layouts put game state and the input surface side by side
+  // instead of stacking them, so a scorer on a dugout iPad can see the count,
+  // baserunners and due batter while recording the play. Keyed off width
+  // rather than device type so it also follows rotation and split view.
+  const { width: windowWidth } = useWindowDimensions();
+  const isWide = windowWidth >= 768;
+
   const { gameState, lineScore, events, loading } = useGameState(gameId, teamId);
   const { recordEvent } = useRecordEvent(gameId);
-  const { isSyncing, lastSyncError, pendingEventsCount, triggerSync } = useSyncContext();
+  const { isSyncing, lastSyncError, isOffline, pendingEventsCount, triggerSync } = useSyncContext();
   const { settings: leagueSettings, leagueId, pitchRule } = useLeagueContext(teamId);
   const maxBatters = getMaxBattingOrder(leagueSettings);
   const midGameExtensionAllowed = isMidGameExtensionAllowed(leagueSettings);
@@ -181,9 +203,162 @@ export default function ScoringScreen() {
   }, [ourTeamPAs]);
 
   const weBat = gameState ? (isHome ? !gameState.isTopOfInning : gameState.isTopOfInning) : false;
+
+  // ─── The opposing side ───────────────────────────────────────────────────
+  // Their roster and batting order, mirrored locally so a scorer keeping the
+  // other team's book keeps working with no signal. Without this every
+  // opponent plate appearance is anonymous: nothing to attribute a hit to,
+  // and nothing to show the coach about who is coming up.
+  const { roster: opponentRoster, slots: opponentSlots } = useOpponentLineup(
+    gameId,
+    game?.opponentTeamId,
+  );
+  // Their completed PAs are the other half's — the mirror of ourTeamPAs.
+  const opponentPAs = gameState
+    ? (isHome ? gameState.completedTopHalfPAs : gameState.completedBottomHalfPAs)
+    : 0;
+  const opponentDueBatter = deriveDueBatter(
+    opponentSlots.map((s) => ({ playerId: s.playerId, battingOrder: s.battingOrder })),
+    opponentPAs,
+  );
+  const [opponentBatterOverrideId, setOpponentBatterOverrideId] = useState<string | null>(null);
+  useEffect(() => {
+    setOpponentBatterOverrideId(null);
+  }, [opponentPAs]);
+  const opponentBatterId =
+    opponentBatterOverrideId ?? opponentDueBatter?.playerId ?? gameState?.currentBatterId ?? null;
+  const opponentNameById = useMemo(
+    () => new Map(opponentSlots.map((s) => [s.playerId, s.name])),
+    [opponentSlots],
+  );
+  const [showOpponentBatterPicker, setShowOpponentBatterPicker] = useState(false);
+  const [showAddOpponentBatter, setShowAddOpponentBatter] = useState(false);
+  const [showAddOurBatter, setShowAddOurBatter] = useState(false);
+  const [caughtStealingFor, setCaughtStealingFor] =
+    useState<{ base: 1 | 2 | 3; runnerId: string; name: string } | null>(null);
+
+  /**
+   * Add someone to the opposing order mid-game, either from their known
+   * roster or as a brand-new name. Both write locally first; the sync engine
+   * pushes the player before the lineup row so the FK holds.
+   */
+  async function handleAddOpponentBatter(input:
+    | { kind: 'roster'; opponentPlayerId: string }
+    | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string }
+  ): Promise<string | null> {
+    const result =
+      input.kind === 'roster'
+        ? await addOpponentBatterFromRoster({
+            gameRemoteId: gameId,
+            opponentPlayerRemoteId: input.opponentPlayerId,
+            maxBatters,
+          })
+        : game?.opponentTeamId
+          ? await addNewOpponentBatter({
+              gameRemoteId: gameId,
+              opponentTeamId: game.opponentTeamId,
+              firstName: input.firstName,
+              lastName: input.lastName,
+              jerseyNumber: input.jerseyNumber,
+              maxBatters,
+            })
+          : ({ ok: false, message: 'This game has no opponent team on file.' } as const);
+
+    if (!result.ok) return result.message;
+    setShowAddOpponentBatter(false);
+    // Sync opportunistically — a failure here is invisible and harmless, the
+    // rows are already durable locally and the next cycle will carry them.
+    triggerSync().catch(() => {});
+    return null;
+  }
+
+  /**
+   * Add someone to OUR order mid-game: a rostered player who wasn't in the
+   * pre-game lineup, or a late arrival who isn't on the roster at all.
+   *
+   * The second path creates a guest-only identity, the same shape the guest
+   * picker produces. It is offered whatever the league's guests.allowed
+   * setting says: that flag governs whether outside players may appear in a
+   * league's games, and a coach standing at a field with a player in front of
+   * them needs to record what actually happened either way. countTowardStats
+   * still follows the league default, so the rule keeps its effect on the
+   * numbers.
+   */
+  async function handleAddOurBatter(input:
+    | { kind: 'roster'; opponentPlayerId: string }
+    | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string }
+  ): Promise<string | null> {
+    if (input.kind === 'roster') {
+      const message = await handleAddBatter(input.opponentPlayerId);
+      if (message) return message;
+      setShowAddOurBatter(false);
+      return null;
+    }
+
+    const jersey = input.jerseyNumber.trim();
+    const result = await createLocalGuest({
+      gameRemoteId: gameId,
+      leagueId: leagueId ?? null,
+      firstName: input.firstName.trim(),
+      lastName: input.lastName.trim(),
+      jerseyNumber: jersey ? Number(jersey) : null,
+      countTowardStats: leagueSettings.guests.countTowardStatsDefault,
+      maxBatters,
+    });
+    if (!result.ok) return result.message;
+    setShowAddOurBatter(false);
+    triggerSync().catch(() => {});
+    return null;
+  }
+
+  // Who follows the batter at the plate, in whichever order is batting —
+  // one PA past the current hitter, and past a manual override too, so
+  // pointing the rotation at someone else moves on-deck with it.
+  //
+  // Falls back to our own due batter when the opponent is up and we have no
+  // order for them: nobody is at our plate then, so the due batter already IS
+  // who leads off our next turn and the slot after them would skip a hitter.
+  const nextBatter = useMemo(() => {
+    const slots = weBat
+      ? battingSlots
+      : opponentSlots.map((s) => ({ playerId: s.playerId, battingOrder: s.battingOrder }));
+    const overrideId = weBat ? batterOverrideId : opponentBatterOverrideId;
+    const current = weBat ? dueBatter : opponentDueBatter;
+
+    if (slots.length === 0) return weBat ? null : dueBatter;
+
+    const overrideIndex = overrideId
+      ? [...slots]
+          .sort((a, b) => a.battingOrder - b.battingOrder)
+          .findIndex((slot) => slot.playerId === overrideId)
+      : -1;
+    const currentIndex = overrideIndex >= 0 ? overrideIndex : current?.index ?? -1;
+    if (currentIndex < 0) return null;
+    return deriveDueBatter(slots, currentIndex + 1);
+  }, [
+    weBat, battingSlots, opponentSlots, batterOverrideId,
+    opponentBatterOverrideId, dueBatter, opponentDueBatter,
+  ]);
+  /**
+   * Name for a next-up slot. The id came from whichever order is batting, so
+   * try the opponent's names first and fall back to ours — the two id spaces
+   * are disjoint (players vs opponent_players), so a hit is unambiguous.
+   */
+  const nextBatterName = (playerId: string) =>
+    opponentNameById.get(playerId) ?? batterName(playerId);
   // Effective batter for our offensive half: manual override → lineup-derived
   // due batter → engine state (GAME_START leadoff when no lineup is set).
   const ourBatterId = batterOverrideId ?? dueBatter?.playerId ?? gameState?.currentBatterId ?? null;
+  /** Whoever is actually at the plate right now, either side. */
+  const currentPlateBatterId = weBat ? ourBatterId : opponentBatterId;
+  const battingOrderTitle = weBat
+    ? `${teamName} batting order`
+    : `${opponentName} batting order`;
+  const onDeckBatterId =
+    nextBatter && nextBatter.playerId !== currentPlateBatterId
+      ? nextBatter.playerId
+      : null;
+
 
   // Our current pitcher, derived from the event stream so it persists across
   // innings — gameState.currentPitcherId is reset to null by INNING_CHANGE, so
@@ -224,7 +399,12 @@ export default function ScoringScreen() {
         ourBatterId,
         ourPitcherId,
         statePitcherId: gameState.currentPitcherId,
-        stateBatterId: gameState.currentBatterId,
+        // Prefer the batter derived from the opponent's own order over
+        // gameState.currentBatterId. The latter is only ever set by a
+        // previous PITCH_THROWN, so for an opponent half it is null until
+        // someone has already batted anonymously — which is exactly the gap
+        // that left their runners without an identity.
+        stateBatterId: opponentBatterId ?? gameState.currentBatterId,
         ourPlayerIds,
       })
     : {};
@@ -273,10 +453,58 @@ export default function ScoringScreen() {
   }, [battingSlots, nameById]);
   const batterName = (id: string) => nameById.get(id) ?? extraNames[id] ?? 'Unknown batter';
 
+  /**
+   * The batting team's order, whichever side that is — the card the scorer
+   * reads between pitches to see who is up, who follows, and who is due an
+   * inning from now. Positions come from the lineup row (a mid-game move is
+   * reflected) and fall back to the player's usual spot.
+   */
+  const battingOrderView = useMemo<BattingOrderRow[]>(() => {
+    if (!weBat) {
+      return opponentSlots.map((slot) => ({
+        playerId: slot.playerId,
+        battingOrder: slot.battingOrder,
+        name: slot.name,
+        position: slot.startingPosition ?? null,
+      }));
+    }
+    const positionByPlayer = new Map(
+      observedLineupRows.map((row) => [row.playerRemoteId, row.startingPosition ?? null]),
+    );
+    const rosterById = new Map(roster.map((p) => [p.id, p]));
+    return [...battingSlots]
+      .sort((a, b) => a.battingOrder - b.battingOrder)
+      .map((slot) => {
+        const player = rosterById.get(slot.playerId);
+        const name = batterName(slot.playerId);
+        return {
+          playerId: slot.playerId,
+          battingOrder: slot.battingOrder,
+          name: player?.jerseyNumber != null ? `#${player.jerseyNumber} ${name}` : name,
+          position:
+            positionByPlayer.get(slot.playerId) ?? player?.primaryPosition ?? null,
+        };
+      });
+  }, [weBat, opponentSlots, battingSlots, observedLineupRows, roster, nameById, extraNames]);
+
   const gameStarted = useMemo(
     () => events.some((e) => e.eventType === EventType.GAME_START),
     [events],
   );
+
+  // What this game is tracking, chosen by the scorer at start and carried on
+  // the GAME_START payload. Same keys and `!== false` defaulting as the web
+  // scorer (see score/page.tsx) so a game started on either client reads the
+  // same on the other, and games started before the toggles existed keep the
+  // old always-on behavior.
+  const scoringConfig = useMemo(() => {
+    const startEvent = events.find((e) => e.eventType === EventType.GAME_START);
+    const gsp = (startEvent?.payload ?? {}) as Record<string, unknown>;
+    return {
+      pitchType: gsp.pitchTypeEnabled !== false,
+      pitchLocation: gsp.pitchLocationEnabled !== false,
+    };
+  }, [events]);
 
   // ─── Pitch-count compliance ─────────────────────────────────────────────
   // Cumulative game total for the pitcher of record (the old label called
@@ -299,6 +527,25 @@ export default function ScoringScreen() {
     pitchRule && displayPitcherId && ourPlayerIds.has(displayPitcherId)
       ? getPitchComplianceStatus(displayPitcherId, currentPitchTotal, pitchRule, gameDateIso)
       : null;
+  const currentStrikeTotal =
+    gameState && displayPitcherId ? gameState.pitcherStrikeCounts[displayPitcherId] ?? 0 : 0;
+
+  // Game totals for the staff currently on the mound — the current pitcher's
+  // own line plus everyone who preceded them for that team. Summed over the
+  // side displayPitcherId belongs to, so a relief appearance reads against
+  // the team's workload rather than against both teams' pitches combined.
+  const staffTotals = useMemo(() => {
+    if (!gameState) return { pitches: 0, strikes: 0 };
+    const displayPitcherIsOurs = displayPitcherId ? ourPlayerIds.has(displayPitcherId) : !weBat;
+    let pitches = 0;
+    let strikes = 0;
+    for (const [pitcherId, count] of Object.entries(gameState.pitcherPitchCounts)) {
+      if (ourPlayerIds.has(pitcherId) !== displayPitcherIsOurs) continue;
+      pitches += count;
+      strikes += gameState.pitcherStrikeCounts[pitcherId] ?? 0;
+    }
+    return { pitches, strikes };
+  }, [gameState, displayPitcherId, ourPlayerIds, weBat]);
 
   // Per-roster-player pitch totals + compliance level for the pitching-change
   // picker, so the coach sees who is near/over their limit before choosing.
@@ -325,12 +572,19 @@ export default function ScoringScreen() {
   // gated on the league's guests.allowed flag.
   const [showGuestModal, setShowGuestModal] = useState(false);
 
-  async function handlePitch(outcome: PitchOutcome, pitchType?: PitchType) {
+  async function handlePitch(
+    outcome: PitchOutcome,
+    pitchType?: PitchType,
+    zoneLocation?: number,
+  ) {
     if (!gameState) return;
     const payload: PitchThrownPayload = {
       ...halfAttribution,
       outcome,
       ...(pitchType ? { pitchType } : {}),
+      // 0 is a meaningful value here (outside the zone), so check for
+      // undefined rather than truthiness.
+      ...(zoneLocation !== undefined ? { zoneLocation } : {}),
     };
     await recordEvent(
       EventType.PITCH_THROWN,
@@ -525,11 +779,35 @@ export default function ScoringScreen() {
     }
   }
 
-  async function handleCaughtStealing(fromBase: 1 | 2 | 3, runnerId: string) {
+  /**
+   * Opens the fielding-sequence prompt rather than recording immediately.
+   *
+   * A caught stealing is a putout and is scored like one — 2-6, 2-4, 2-5 —
+   * and the sequence is what a coach reads back later to see how the play
+   * went. Both entry points (the runners panel and the base-tap sheet) come
+   * through here, so the two cannot drift apart.
+   */
+  function handleCaughtStealing(fromBase: 1 | 2 | 3, runnerId: string) {
+    setCaughtStealingFor({ base: fromBase, runnerId, name: runnerName(runnerId) });
+  }
+
+  async function recordCaughtStealing(
+    fromBase: 1 | 2 | 3,
+    runnerId: string,
+    fieldingSequence: number[],
+  ) {
     if (!gameState) return;
     const toBase = (fromBase + 1) as 2 | 3 | 4;
-    const payload: BaserunnerMovePayload = { runnerId, fromBase, toBase };
+    const payload: BaserunnerMovePayload = {
+      runnerId,
+      fromBase,
+      toBase,
+      // Omitted rather than sent empty when the scorer skipped it: an absent
+      // sequence means "not recorded", which an empty array would blur.
+      ...(fieldingSequence.length > 0 ? { fieldingSequence } : {}),
+    };
     await recordEvent(EventType.CAUGHT_STEALING, gameState.inning, gameState.isTopOfInning, payload);
+    setCaughtStealingFor(null);
   }
 
   async function advanceAllRunnersOneBase(reason: AdvanceReason) {
@@ -615,7 +893,11 @@ export default function ScoringScreen() {
     });
   }
 
-  async function handleStartGame(pitcherId: string, batterId: string) {
+  async function handleStartGame(
+    pitcherId: string,
+    batterId: string,
+    tracking: { pitchType: boolean; pitchLocation: boolean },
+  ) {
     if (!gameState) return;
     // `isHome` is derived from the async-resolved Game row and defaults to
     // true before it loads. Block starting until the row is present so a road
@@ -628,10 +910,27 @@ export default function ScoringScreen() {
     // Which team are we scoring? `isHome` comes from the resolved Game row's
     // locationType / neutralHomeTeam so road games seed the away* lineup
     // slots instead of misattributing to home*.
-    const payload = isHome
-      ? { homeLineupPitcherId: pitcherId, homeLeadoffBatterId: batterId }
-      : { awayLineupPitcherId: pitcherId, awayLeadoffBatterId: batterId };
-    await recordEvent(EventType.GAME_START, gameState.inning, gameState.isTopOfInning, payload);
+    const payload = {
+      ...(isHome
+        ? { homeLineupPitcherId: pitcherId, homeLeadoffBatterId: batterId }
+        : { awayLineupPitcherId: pitcherId, awayLeadoffBatterId: batterId }),
+      // Same keys the web scorer writes, so either client can read the other's
+      // games. Read back via scoringConfig above.
+      pitchTypeEnabled: tracking.pitchType,
+      pitchLocationEnabled: tracking.pitchLocation,
+    };
+    try {
+      await recordEvent(EventType.GAME_START, gameState.inning, gameState.isTopOfInning, payload);
+    } catch (err) {
+      // Without this the modal just sat there with no explanation — the
+      // scorer has no way to tell a failed start from an unresponsive tap.
+      console.warn(`handleStartGame: recording GAME_START failed game=${gameId}:`, err);
+      Alert.alert(
+        "Couldn't start the game",
+        'The starting lineup was not saved. Check your connection and try again.',
+      );
+      return;
+    }
     // Reflect the transition locally right away (list badge); the server
     // flips via fn_start_game in the sync engine's lifecycle scan.
     if (game && game.status === 'scheduled') {
@@ -770,12 +1069,17 @@ export default function ScoringScreen() {
    * replay AND create a local game_lineups row so MaxPreps export, season
    * stats, and post-game queries pick the new batter up once it syncs.
    */
-  async function handleAddBatter(newBatterId: string) {
-    if (!gameState) return;
+  /**
+   * Returns null on success, or the reason it could not add the batter.
+   * The caller surfaces that: silently closing the modal made a full order
+   * look like a successful add.
+   */
+  async function handleAddBatter(newBatterId: string): Promise<string | null> {
+    if (!gameState) return 'The game is still loading.';
     // Don't add anyone until the lineup observation has fired — computing
     // currentMax=0 against an unloaded lineup would collide with the real
     // slot-1 occupant.
-    if (!lineupLoaded) return;
+    if (!lineupLoaded) return 'The lineup is still loading.';
 
     // Build the set of player ids already in the BATTING ORDER (bench rows
     // with a null order — e.g. a non-batting pitcher under DH rules — stay
@@ -813,7 +1117,8 @@ export default function ScoringScreen() {
     // tighter. Bail before emitting an event that the persistence layer would
     // reject; the SUBSTITUTION would still land in the event log and diverge
     // replay from the DB state.
-    if (activePlayerIds.has(newBatterId) || currentMax >= maxBatters) return;
+    if (activePlayerIds.has(newBatterId)) return 'That player is already in the order.';
+    if (currentMax >= maxBatters) return `The order is full at ${maxBatters} batters.`;
 
     const battingOrderPosition = currentMax + 1;
 
@@ -860,6 +1165,11 @@ export default function ScoringScreen() {
       );
     }
     triggerSync().catch(console.warn);
+    // The batter is in the order either way — the SUBSTITUTION event is the
+    // authoritative source for live play, and the mirror row is a
+    // convenience for post-game consumers. A failed mirror write is logged,
+    // not reported to the scorer as a failed add.
+    return null;
   }
 
   // Only scan this far back when searching for an event to void. Typical
@@ -957,14 +1267,61 @@ export default function ScoringScreen() {
   }
 
   async function handlePickoffOut(fromBase: 1 | 2 | 3, runnerId: string) {
+    await handlePickoff(fromBase, runnerId, 'out');
+  }
+
+  /**
+   * A pickoff throw has three results worth recording, and only one of them
+   * retires the runner.
+   *
+   * 'error' is written as a safe pickoff plus a linked BASERUNNER_ADVANCE
+   * rather than a new PickoffPayload outcome. The runner genuinely was safe —
+   * the throw did not retire him — and the advance then runs through the
+   * same path as every other error advance, including scoring from third.
+   * Five separate consumers branch on a pickoff's outcome (the engine, the
+   * line score, pitching stats, the history tree and the live ticker); a new
+   * value there would have to be taught to all of them, and any one missed
+   * would put the derived state quietly out of step with the engine.
+   */
+  async function handlePickoff(
+    fromBase: 1 | 2 | 3,
+    runnerId: string,
+    outcome: 'safe' | 'out' | 'error',
+  ) {
     if (!gameState) return;
     const payload: PickoffPayload = {
       runnerId,
       base: fromBase,
       ...pitcherAttribution,
-      outcome: 'out',
+      outcome: outcome === 'out' ? 'out' : 'safe',
     };
-    await recordEvent(EventType.PICKOFF_ATTEMPT, gameState.inning, gameState.isTopOfInning, payload);
+    const pickoffEventId = await recordEvent(
+      EventType.PICKOFF_ATTEMPT,
+      gameState.inning,
+      gameState.isTopOfInning,
+      payload,
+    );
+
+    if (outcome !== 'error') return;
+
+    const toBase = (fromBase + 1) as 2 | 3 | 4;
+    const advance: BaserunnerMovePayload = {
+      runnerId,
+      fromBase,
+      toBase,
+      reason: AdvanceReason.ERROR,
+      relatedEventId: pickoffEventId,
+    };
+    await recordEvent(
+      EventType.BASERUNNER_ADVANCE,
+      gameState.inning,
+      gameState.isTopOfInning,
+      advance,
+    );
+    if (toBase === 4) {
+      const scorePayload: ScorePayload = { scoringPlayerId: runnerId, rbis: 0 };
+      await recordEvent(EventType.SCORE, gameState.inning, gameState.isTopOfInning, scorePayload);
+    }
   }
 
   async function handleBalk() {
@@ -1039,6 +1396,46 @@ export default function ScoringScreen() {
     if (thirdRunner)  out.push({ base: 3, runnerId: thirdRunner });
     return out;
   }, [firstRunner, secondRunner, thirdRunner]);
+
+  // ─── Naming the runners ──────────────────────────────────────────────────
+  // A runner id is one of ours, one of the opponent's, or — for an opponent
+  // half scored without their order entered — a stand-in the engine minted to
+  // hold the base. The two id spaces are disjoint, so trying each in turn is
+  // unambiguous; the stand-in matches nothing and stays deliberately unnamed
+  // rather than borrowing someone else's name.
+  const runnerIdentity = useMemo(() => {
+    const m = new Map<string, { name: string; short: string }>();
+    for (const p of roster) {
+      m.set(p.id, {
+        name: p.jerseyNumber != null ? `#${p.jerseyNumber} ${p.name}` : p.name,
+        short: p.jerseyNumber != null ? String(p.jerseyNumber) : initialsOf(p.name),
+      });
+    }
+    for (const s of opponentSlots) {
+      m.set(s.playerId, {
+        name: s.name,
+        short: s.jerseyNumber || String(s.battingOrder),
+      });
+    }
+    return m;
+  }, [roster, opponentSlots]);
+
+  const runnerName = (id: string) =>
+    runnerIdentity.get(id)?.name ?? nameById.get(id) ?? extraNames[id] ?? 'Unnamed runner';
+  const runnerShortLabel = (id: string) => {
+    const known = runnerIdentity.get(id)?.short;
+    if (known) return known;
+    const fallback = nameById.get(id) ?? extraNames[id];
+    return fallback ? initialsOf(fallback) : '•';
+  };
+  const namedRunners = useMemo(
+    () =>
+      // Lead runner first: that is the one a coach decides about.
+      [...runnersOnBase]
+        .sort((a, b) => b.base - a.base)
+        .map((r) => ({ ...r, name: runnerName(r.runnerId) })),
+    [runnersOnBase, runnerIdentity, nameById, extraNames],
+  );
 
   if (loading || !gameState) {
     return <LoadingSpinner fullScreen />;
@@ -1123,12 +1520,40 @@ export default function ScoringScreen() {
     <View className="flex-1 bg-white">
       <Stack.Screen options={{ title: `vs ${opponentName}`, headerShown: true }} />
 
-      {/* Top: scoreboard */}
+      {/* Top: scoreboard — spans the full width above both panes so the score
+          line reads across the whole screen instead of being boxed into the
+          left column. */}
       <ScoreBoard
         gameState={gameState}
         opponentName={awayLabel}
         teamName={homeLabel}
       />
+
+      <PaneRow isWide={isWide}>
+      <BookPane isWide={isWide}>
+
+      {/* Book toolbar. These were floating over the pane on absolute
+          positioning, which put them on top of the count once this column
+          started with it — they are ordinary controls, so they sit in the
+          flow like ordinary controls. */}
+      <View className="flex-row items-center gap-2 px-4 pt-2">
+        <TouchableOpacity
+          onPress={() =>
+            router.push({ pathname: '/(tabs)/games/[gameId]/lineup', params: { gameId } })
+          }
+          className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
+        >
+          <Text className="text-xs font-semibold text-gray-700">Full lineup</Text>
+        </TouchableOpacity>
+        {leagueSettings.guests.allowed && (
+          <TouchableOpacity
+            onPress={() => setShowGuestModal(true)}
+            className="px-3 py-1.5 rounded-full bg-emerald-100 border border-emerald-200"
+          >
+            <Text className="text-xs font-semibold text-emerald-800">+ Guest</Text>
+          </TouchableOpacity>
+        )}
+      </View>
 
       {/* League-rule advisories (mercy / run cap / regulation complete) */}
       {gameEndDecision && !gameState.isFinal && (
@@ -1172,38 +1597,9 @@ export default function ScoringScreen() {
 
       {/* Middle: count + baserunners */}
       <CountDisplay gameState={gameState} />
+      {/* Pitch counts live in the input pane — the scorer watches them while
+          calling pitches, not while reading the count. */}
       <View className="flex-row items-center justify-between px-5 py-3 border-b border-gray-100">
-        <View>
-          <Text className="text-xs text-gray-500">Pitches (game)</Text>
-          <View className="flex-row items-center gap-1.5">
-            <Text className="text-lg font-bold text-gray-900">{currentPitchTotal}</Text>
-            {pitchStatus && (pitchStatus.isOverLimit || pitchStatus.isAtLimit || pitchStatus.isAtWarning) && (
-              <View
-                className={`px-2 py-0.5 rounded-full ${
-                  pitchStatus.isOverLimit
-                    ? 'bg-red-600'
-                    : pitchStatus.isAtLimit
-                      ? 'bg-red-100'
-                      : 'bg-amber-100'
-                }`}
-              >
-                <Text
-                  className={`text-xs font-semibold ${
-                    pitchStatus.isOverLimit
-                      ? 'text-white'
-                      : pitchStatus.isAtLimit
-                        ? 'text-red-700'
-                        : 'text-amber-700'
-                  }`}
-                >
-                  {pitchStatus.isOverLimit
-                    ? `Over limit (${pitchStatus.maxAllowed})`
-                    : `${currentPitchTotal}/${pitchStatus.maxAllowed}`}
-                </Text>
-              </View>
-            )}
-          </View>
-        </View>
         <BaserunnerDisplay
           gameState={gameState}
           onRecordStolenBase={handleStolenBase}
@@ -1217,9 +1613,19 @@ export default function ScoringScreen() {
               : undefined
           }
           roster={roster}
+          runnerShortLabel={runnerShortLabel}
+          runnerName={runnerName}
         />
+        {/* Offline is a normal state for field scoring, so it reads as
+            information, not a fault. A red warning is reserved for a sync
+            that actually failed while connected — otherwise the scorer
+            learns to ignore the one signal that should mean something. */}
         {isSyncing ? (
           <Text className="text-xs text-blue-500">Syncing…</Text>
+        ) : isOffline ? (
+          <Text className="text-xs text-slate-500">
+            Offline{pendingEventsCount > 0 ? ` · ${pendingEventsCount} saved` : ' · saved on device'}
+          </Text>
         ) : lastSyncError ? (
           <Text className="text-xs text-red-600">⚠ Sync failed</Text>
         ) : pendingEventsCount > 0 ? (
@@ -1227,33 +1633,11 @@ export default function ScoringScreen() {
         ) : null}
       </View>
 
-      {/* Game controls — manual half-inning switch (run cap, time limit,
-          corrections) and game completion */}
-      {gameStarted && !gameState.isFinal && gameState.outs < OUTS_PER_INNING && (
-        <View className="flex-row items-center gap-2 px-4 pt-2">
-          <TouchableOpacity
-            onPress={confirmInningChange}
-            className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
-          >
-            <Text className="text-xs font-semibold text-gray-700">End Inning ▸</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={confirmEndGame}
-            className={`px-3 py-1.5 rounded-full border ${
-              gameEndDecision
-                ? 'bg-amber-100 border-amber-300'
-                : 'bg-gray-100 border-gray-200'
-            }`}
-          >
-            <Text className={`text-xs font-semibold ${gameEndDecision ? 'text-amber-800' : 'text-gray-700'}`}>
-              End Game
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {/* Pre-game lineup prompt — visible until a starting pitcher is known */}
-      {gameState.currentPitcherId === null && (
+      {/* Pre-game lineup prompt. Keyed off ourPitcherId, not
+          gameState.currentPitcherId: INNING_CHANGE resets the latter to null,
+          so this used to reappear at the top of every half-inning of a game
+          that had been under way for an hour. */}
+      {ourPitcherId === null && (
         <TouchableOpacity
           className="mx-4 mt-2 p-3 bg-amber-50 border border-amber-300 rounded-lg flex-row items-center"
           onPress={() => setShowLineupModal(true)}
@@ -1289,55 +1673,77 @@ export default function ScoringScreen() {
         onClose={() => setShowGuestModal(false)}
       />
 
-      {leagueSettings.guests.allowed && (
-        <TouchableOpacity
-          onPress={() => setShowGuestModal(true)}
-          className="absolute top-2 right-3 px-3 py-1.5 rounded-full bg-emerald-700/90"
-        >
-          <Text className="text-xs font-semibold text-white">+ Guest</Text>
-        </TouchableOpacity>
+
+      {/* Next up — on deck while we bat, leading off our next half while the
+          opponent does. Named for what it is in each case so the scorer
+          doesn't have to work out which. */}
+      {gameStarted && battingOrderView.length > 0 && (
+        <BattingOrderCard
+          title={battingOrderTitle}
+          rows={battingOrderView}
+          currentBatterId={currentPlateBatterId}
+          onDeckBatterId={onDeckBatterId}
+          accent={weBat ? 'ours' : 'theirs'}
+          headerRight={
+            <View className="flex-row items-center gap-2">
+              {(weBat ? battingSlots.length > 0 : opponentSlots.length > 0) && (
+                <TouchableOpacity
+                  onPress={() =>
+                    weBat ? setShowBatterPicker(true) : setShowOpponentBatterPicker(true)
+                  }
+                  className={`px-3 py-1 rounded-full ${weBat ? 'bg-emerald-600' : 'bg-slate-600'}`}
+                >
+                  <Text className="text-xs font-semibold text-white">Change</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                onPress={() =>
+                  weBat ? setShowAddOurBatter(true) : setShowAddOpponentBatter(true)
+                }
+                className={`px-3 py-1 rounded-full ${weBat ? 'bg-emerald-100' : 'bg-slate-200'}`}
+              >
+                <Text
+                  className={`text-xs font-semibold ${weBat ? 'text-emerald-800' : 'text-slate-700'}`}
+                >
+                  + Batter
+                </Text>
+              </TouchableOpacity>
+            </View>
+          }
+        />
       )}
-
-      <TouchableOpacity
-        onPress={() =>
-          router.push({
-            pathname: '/(tabs)/games/[gameId]/lineup',
-            params: { gameId },
-          })
-        }
-        className="absolute top-2 left-3 px-3 py-1.5 rounded-full bg-gray-700/90"
-      >
-        <Text className="text-xs font-semibold text-white">Lineup</Text>
-      </TouchableOpacity>
-
-      {/* Now batting — due-batter rotation with per-PA override */}
-      {gameStarted && (weBat ? (
-        <View className="flex-row items-center justify-between px-4 py-2 bg-emerald-50 border-t border-emerald-100">
-          <Text className="flex-1 text-sm text-emerald-900" numberOfLines={1}>
-            <Text className="text-xs text-emerald-700">Now batting{'  '}</Text>
-            <Text className="font-semibold">
-              {ourBatterId ? batterName(ourBatterId) : 'No batter set'}
-            </Text>
-            {batterOverrideId && batterOverrideId !== dueBatter?.playerId ? (
-              <Text className="text-xs text-amber-700">{'  '}(override)</Text>
-            ) : dueBatter && ourBatterId === dueBatter.playerId ? (
-              <Text className="text-xs text-emerald-700">{'  '}(slot {dueBatter.battingOrder})</Text>
-            ) : null}
+      {/* An empty order still needs its Add control — the batter buttons live
+          in the card header, and the opponent's book starts empty, so without
+          this there is no way to enter the first one. */}
+      {gameStarted && battingOrderView.length === 0 && (
+        <View className="flex-row items-center px-4 py-2 border-t border-gray-100">
+          <Text className="flex-1 text-sm text-gray-500" numberOfLines={1}>
+            No {weBat ? 'batting order' : `${opponentName} order`} set
           </Text>
-          {battingSlots.length > 0 && (
-            <TouchableOpacity
-              onPress={() => setShowBatterPicker(true)}
-              className="ml-2 px-3 py-1 rounded-full bg-emerald-600"
+          <TouchableOpacity
+            onPress={() =>
+              weBat ? setShowAddOurBatter(true) : setShowAddOpponentBatter(true)
+            }
+            className={`px-3 py-1 rounded-full ${weBat ? 'bg-emerald-100' : 'bg-slate-200'}`}
+          >
+            <Text
+              className={`text-xs font-semibold ${weBat ? 'text-emerald-800' : 'text-slate-700'}`}
             >
-              <Text className="text-xs font-semibold text-white">Change</Text>
-            </TouchableOpacity>
-          )}
+              + Batter
+            </Text>
+          </TouchableOpacity>
         </View>
-      ) : (
-        <View className="px-4 py-2 bg-gray-50 border-t border-gray-100">
-          <Text className="text-xs text-gray-500">Opponent batting</Text>
+      )}
+      {gameStarted && battingOrderView.length === 0 && nextBatter
+        && nextBatter.playerId !== currentPlateBatterId && (
+        <View className="flex-row items-center px-4 py-2 border-t border-gray-100">
+          <Text className="text-xs text-gray-500 w-20">Up next</Text>
+          <Text className="flex-1 text-sm text-gray-900" numberOfLines={1}>
+            <Text className="font-semibold">{nextBatterName(nextBatter.playerId)}</Text>
+            <Text className="text-xs text-gray-500">{'  '}slot {nextBatter.battingOrder}</Text>
+          </Text>
         </View>
-      ))}
+      )}
 
       <BatterPickerModal
         visible={showBatterPicker}
@@ -1351,6 +1757,87 @@ export default function ScoringScreen() {
         }}
         onCancel={() => setShowBatterPicker(false)}
       />
+
+      <OpponentBatterPickerModal
+        visible={showOpponentBatterPicker}
+        slots={opponentSlots}
+        dueBatterId={opponentDueBatter?.playerId ?? null}
+        selectedId={opponentBatterId}
+        onSelect={(playerId) => {
+          setOpponentBatterOverrideId(playerId);
+          setShowOpponentBatterPicker(false);
+        }}
+        onCancel={() => setShowOpponentBatterPicker(false)}
+      />
+
+      <AddBatterModal
+        visible={showAddOpponentBatter}
+        title={`Add ${opponentName} batter`}
+        rosterLabel="ON THEIR ROSTER"
+        roster={opponentRoster
+          .filter((p) => !opponentNameById.has(p.remoteId))
+          .map((p) => ({ id: p.remoteId, name: opponentDisplayName(p) }))}
+        onSubmit={handleAddOpponentBatter}
+        onCancel={() => setShowAddOpponentBatter(false)}
+      />
+
+      <CaughtStealingModal
+        runner={caughtStealingFor}
+        onRecord={(sequence) => {
+          if (caughtStealingFor) {
+            recordCaughtStealing(
+              caughtStealingFor.base,
+              caughtStealingFor.runnerId,
+              sequence,
+            ).catch(console.warn);
+          }
+        }}
+        onCancel={() => setCaughtStealingFor(null)}
+      />
+
+      <AddBatterModal
+        visible={showAddOurBatter}
+        title="Add batter"
+        rosterLabel="ON YOUR ROSTER"
+        roster={roster
+          .filter((p) => !battingSlots.some((slot) => slot.playerId === p.id))
+          .map((p) => ({
+            id: p.id,
+            name: p.jerseyNumber != null ? `#${p.jerseyNumber} ${p.name}` : p.name,
+          }))}
+        onSubmit={handleAddOurBatter}
+        onCancel={() => setShowAddOurBatter(false)}
+      />
+
+      </BookPane>
+      <ActionPane isWide={isWide}>
+
+      {gameStarted && (
+        <RunnersPanel
+          runners={namedRunners}
+          onSteal={handleStolenBase}
+          onCaught={handleCaughtStealing}
+          onAdvance={handleRunnerAdvance}
+          onPickoff={handlePickoff}
+        />
+      )}
+
+      {gameStarted && (
+        <PitchCountStrip
+          pitcherLabel={
+            displayPitcherId
+              ? ourPlayerIds.has(displayPitcherId)
+                ? batterName(displayPitcherId)
+                : 'Opponent pitcher'
+              : 'No pitcher set'
+          }
+          pitches={currentPitchTotal}
+          strikes={currentStrikeTotal}
+          staffPitches={staffTotals.pitches}
+          staffStrikes={staffTotals.strikes}
+          status={pitchStatus}
+        />
+      )}
 
       {/* Bottom: 3-outs prompt or pitch / outcome input. deriveGameState
           holds the half open until an explicit INNING_CHANGE, so at 3 outs
@@ -1399,6 +1886,8 @@ export default function ScoringScreen() {
       ) : (
       <PitchInput
         onRecordPitch={handlePitch}
+        trackPitchType={scoringConfig.pitchType}
+        trackPitchLocation={scoringConfig.pitchLocation}
         onRecordHit={handleHit}
         onRecordHitWithRunnerOutcomes={handleHitWithRunnerOutcomes}
         onRecordOut={handleOut}
@@ -1433,6 +1922,159 @@ export default function ScoringScreen() {
         d3kModalOpen={showD3KModal}
         setD3KModalOpen={setShowD3KModal}
       />
+      )}
+
+      {/* Secondary actions sit under the input surface: reached a few times
+          a game, so they belong with the other taps but below the ones made
+          every pitch. */}
+      {gameStarted && !gameState.isFinal && gameState.outs < OUTS_PER_INNING && (
+        <View className="flex-row items-center gap-2 px-4 py-2 border-t border-gray-100">
+          <TouchableOpacity
+            onPress={confirmInningChange}
+            className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
+          >
+            <Text className="text-xs font-semibold text-gray-700">End Inning ▸</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={confirmEndGame}
+            className={`px-3 py-1.5 rounded-full border ${
+              gameEndDecision ? 'bg-amber-100 border-amber-300' : 'bg-gray-100 border-gray-200'
+            }`}
+          >
+            <Text className={`text-xs font-semibold ${gameEndDecision ? 'text-amber-800' : 'text-gray-700'}`}>
+              End Game
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+      </ActionPane>
+      </PaneRow>
+    </View>
+  );
+}
+
+/**
+ * Side-by-side on tablets, stacked on phones. Split out as components rather
+ * than inline ternaries so the two panes stay readable — conditionally
+ * wrapping a block in JSX needs matched tags on both sides.
+ */
+function PaneRow({ isWide, children }: { isWide: boolean; children: ReactNode }) {
+  return (
+    <View className="flex-1" style={isWide ? { flexDirection: 'row' } : undefined}>
+      {children}
+    </View>
+  );
+}
+
+/**
+ * The book — everything the scorer READS: the count, the bases, the order.
+ *
+ * The screen had drifted into three columns with the same fact in two of
+ * them (who is at the plate was both a "Now batting" line and a highlighted
+ * lineup row). One reading column and one tapping column is fewer places to
+ * look, and it lets each fact live exactly once.
+ *
+ * The flex lives on a plain View and the ScrollView fills it. An uneven flex
+ * set directly on a ScrollView is not honoured — it collapses towards its
+ * content — which is why earlier splits only ever worked at 1:1.
+ */
+function BookPane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
+  if (!isWide) return <>{children}</>;
+  return (
+    <View className="border-r border-gray-200 bg-white" style={{ flex: 5 }}>
+      <ScrollView style={{ flex: 1 }}>{children}</ScrollView>
+    </View>
+  );
+}
+
+/**
+ * The action surface — everything the scorer TAPS. Never scrolls, so the
+ * buttons are always where they were last time. Given the larger share:
+ * it is touched dozens of times an inning, the book is read.
+ */
+function ActionPane({ isWide, children }: { isWide: boolean; children: ReactNode }) {
+  if (!isWide) return <>{children}</>;
+  return <View style={{ flex: 7 }}>{children}</View>;
+}
+
+/** Pitches / strikes / strike% for one line of the strip. */
+function CountGroup({
+  label,
+  pitches,
+  strikes,
+  emphasis,
+}: {
+  label: string;
+  pitches: number;
+  strikes: number;
+  emphasis?: boolean;
+}) {
+  // Percentage of nothing is nothing to report — an em dash beats "0%" or NaN
+  // before the first pitch.
+  const pct = pitches > 0 ? Math.round((strikes / pitches) * 100) : null;
+  return (
+    <View className="flex-1">
+      <Text className="text-[11px] text-gray-500" numberOfLines={1}>
+        {label}
+      </Text>
+      <View className="flex-row items-baseline gap-1.5 mt-0.5">
+        <Text className={emphasis ? 'text-2xl font-bold text-gray-900' : 'text-lg font-semibold text-gray-700'}>
+          {pitches}
+        </Text>
+        <Text className="text-[11px] text-gray-500">P</Text>
+        <Text className={emphasis ? 'text-lg font-semibold text-gray-700' : 'text-base font-semibold text-gray-600'}>
+          {strikes}
+        </Text>
+        <Text className="text-[11px] text-gray-500">S</Text>
+        <Text className="text-[11px] text-gray-400">{pct === null ? '—' : `${pct}%`}</Text>
+      </View>
+    </View>
+  );
+}
+
+/**
+ * Pitch and strike totals, sitting above the action surface: the pitcher on
+ * the mound and the staff behind them. This is the number a coach acts on
+ * mid-inning — whether to warm someone up — so it lives where the eye already
+ * is between pitches rather than across the screen in the context pane.
+ */
+function PitchCountStrip({
+  pitcherLabel,
+  pitches,
+  strikes,
+  staffPitches,
+  staffStrikes,
+  status,
+}: {
+  pitcherLabel: string;
+  pitches: number;
+  strikes: number;
+  staffPitches: number;
+  staffStrikes: number;
+  status: { isOverLimit: boolean; isAtLimit: boolean; isAtWarning: boolean; maxAllowed: number } | null;
+}) {
+  const flagged = status !== null && (status.isOverLimit || status.isAtLimit || status.isAtWarning);
+  return (
+    <View className="flex-row items-center gap-3 px-4 py-2.5 border-b border-gray-200 bg-gray-50">
+      <CountGroup label={pitcherLabel} pitches={pitches} strikes={strikes} emphasis />
+      <View className="w-px self-stretch bg-gray-200" />
+      <CountGroup label="All pitchers · game" pitches={staffPitches} strikes={staffStrikes} />
+      {flagged && status && (
+        <View
+          className={`px-2.5 py-1 rounded-full ${
+            status.isOverLimit ? 'bg-red-600' : status.isAtLimit ? 'bg-red-100' : 'bg-amber-100'
+          }`}
+        >
+          <Text
+            className={`text-xs font-semibold ${
+              status.isOverLimit ? 'text-white' : status.isAtLimit ? 'text-red-700' : 'text-amber-700'
+            }`}
+          >
+            {status.isOverLimit
+              ? `Over limit (${status.maxAllowed})`
+              : `${pitches}/${status.maxAllowed}`}
+          </Text>
+        </View>
       )}
     </View>
   );
@@ -1511,6 +2153,685 @@ function BatterPickerModal({
   );
 }
 
+/** "Griffin Baldwin" -> "GB"; the fallback when we have no jersey number. */
+function initialsOf(name: string): string {
+  const parts = name.replace(/^#\S+\s*/, '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '\u2022';
+  return parts.slice(0, 2).map((w) => w[0]!.toUpperCase()).join('');
+}
+
+/** One runner action — a quiet pill, since a row of these sits under a name. */
+function RunnerAction({
+  label,
+  tone,
+  onPress,
+}: {
+  label: string;
+  tone: string;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity className={`px-2.5 py-1.5 rounded-lg border ${tone}`} onPress={onPress}>
+      <Text className="text-[11px] font-semibold">{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+const BASE_ABBREV: Record<1 | 2 | 3, string> = { 1: '1B', 2: '2B', 3: '3B' };
+
+/**
+ * Who is on base and what can happen to them, in one place.
+ *
+ * These plays were reachable only by tapping a base in the diamond or opening
+ * the Runners sheet — two drills for the events that happen while the scorer
+ * is already watching a pitch. With someone aboard the choices are few and
+ * known, so they are laid out rather than hidden.
+ *
+ * The rarer per-runner plays (pinch runner, courtesy runner) stay behind the
+ * base tap: they are substitutions, not pitches, and are not worth the room.
+ */
+function RunnersPanel({
+  runners,
+  onSteal,
+  onCaught,
+  onAdvance,
+  onPickoff,
+}: {
+  runners: Array<{ base: 1 | 2 | 3; runnerId: string; name: string }>;
+  onSteal: (base: 1 | 2 | 3, runnerId: string) => void;
+  onCaught: (base: 1 | 2 | 3, runnerId: string) => void;
+  onAdvance: (base: 1 | 2 | 3, runnerId: string, reason: AdvanceReason) => void;
+  onPickoff: (base: 1 | 2 | 3, runnerId: string, outcome: PickoffOutcome) => void;
+}) {
+  const [pickoffFor, setPickoffFor] =
+    useState<{ base: 1 | 2 | 3; runnerId: string; name: string } | null>(null);
+  if (runners.length === 0) return null;
+  return (
+    <View className="px-4 py-2 border-b border-gray-200 bg-white">
+      <Text className="text-[11px] font-semibold text-gray-500 mb-1.5">ON BASE</Text>
+      <View className="gap-1.5">
+        {runners.map((r) => (
+          <View key={`${r.base}-${r.runnerId}`} className="flex-row items-center gap-1.5">
+            <View className="w-8 py-1 rounded-md bg-amber-100 items-center">
+              <Text className="text-[11px] font-bold text-amber-800">{BASE_ABBREV[r.base]}</Text>
+            </View>
+            <Text className="flex-1 text-[13px] text-gray-900" numberOfLines={1}>
+              {r.name}
+            </Text>
+            <RunnerAction
+              label="Steal"
+              tone="bg-sky-50 border-sky-200"
+              onPress={() => onSteal(r.base, r.runnerId)}
+            />
+            <RunnerAction
+              label="Caught"
+              tone="bg-rose-50 border-rose-200"
+              onPress={() => onCaught(r.base, r.runnerId)}
+            />
+            <RunnerAction
+              label="Wild pitch"
+              tone="bg-amber-50 border-amber-200"
+              onPress={() => onAdvance(r.base, r.runnerId, AdvanceReason.WILD_PITCH)}
+            />
+            <RunnerAction
+              label="Passed ball"
+              tone="bg-yellow-50 border-yellow-200"
+              onPress={() => onAdvance(r.base, r.runnerId, AdvanceReason.PASSED_BALL)}
+            />
+            <RunnerAction
+              label="Pickoff"
+              tone="bg-slate-100 border-slate-300"
+              onPress={() => setPickoffFor(r)}
+            />
+          </View>
+        ))}
+      </View>
+
+      <PickoffOutcomeModal
+        runner={pickoffFor}
+        onPick={(outcome) => {
+          if (pickoffFor) onPickoff(pickoffFor.base, pickoffFor.runnerId, outcome);
+          setPickoffFor(null);
+        }}
+        onCancel={() => setPickoffFor(null)}
+      />
+    </View>
+  );
+}
+
+/**
+ * Standard notations for a caught stealing, by the base being stolen.
+ * Offered as one tap because they cover nearly every one that happens; the
+ * grid underneath handles the rest.
+ */
+const CS_PRESETS: Record<1 | 2 | 3, { seq: number[]; hint: string }[]> = {
+  1: [
+    { seq: [2, 4], hint: 'C to 2B' },
+    { seq: [2, 6], hint: 'C to SS' },
+  ],
+  2: [
+    { seq: [2, 5], hint: 'C to 3B' },
+    { seq: [2, 6], hint: 'C to SS' },
+  ],
+  3: [
+    { seq: [2], hint: 'C unassisted' },
+    { seq: [1, 2], hint: 'P to C' },
+  ],
+};
+
+const STOLEN_BASE_LABEL: Record<1 | 2 | 3, string> = { 1: '2nd', 2: '3rd', 3: 'home' };
+
+/**
+ * How the caught stealing was turned — 2-6, 2-4, 2-5.
+ *
+ * The sequence is optional: a scorer who only saw the out should not be
+ * blocked from recording it, and an absent sequence reads as "not recorded"
+ * rather than as a claim about the play.
+ */
+function CaughtStealingModal({
+  runner,
+  onRecord,
+  onCancel,
+}: {
+  runner: { base: 1 | 2 | 3; runnerId: string; name: string } | null;
+  onRecord: (sequence: number[]) => void;
+  onCancel: () => void;
+}) {
+  const [sequence, setSequence] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (runner) setSequence([]);
+  }, [runner]);
+
+  if (!runner) return null;
+  const presets = CS_PRESETS[runner.base];
+
+  return (
+    <Modal visible transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '90%' }}>
+          <Text className="text-lg font-bold text-gray-900 mb-1">
+            Caught stealing {STOLEN_BASE_LABEL[runner.base]}
+          </Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            {runner.name} — who made the play?
+          </Text>
+
+          <View className="flex-row items-center mb-4">
+            <Text className="text-xs text-gray-500 w-16">Sequence</Text>
+            <Text className="flex-1 text-2xl font-bold text-gray-900">
+              {sequence.length > 0 ? formatFieldingSequence(sequence) : '—'}
+            </Text>
+            {sequence.length > 0 && (
+              <TouchableOpacity
+                onPress={() => setSequence((prev) => prev.slice(0, -1))}
+                className="px-3 py-1.5 rounded-full bg-gray-100 border border-gray-200"
+              >
+                <Text className="text-xs font-semibold text-gray-700">Undo</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          <ScrollView style={{ maxHeight: 400 }}>
+            <Text className="text-[11px] font-semibold text-gray-500 mb-2">COMMON</Text>
+            <View className="flex-row gap-2 mb-5">
+              {presets.map((preset) => (
+                <TouchableOpacity
+                  key={preset.seq.join('-')}
+                  onPress={() => setSequence(preset.seq)}
+                  className="px-4 py-2.5 rounded-xl bg-white border border-sky-300"
+                >
+                  <Text className="text-base font-bold text-sky-900">
+                    {formatFieldingSequence(preset.seq)}
+                  </Text>
+                  <Text className="text-[11px] text-gray-500">{preset.hint}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text className="text-[11px] font-semibold text-gray-500 mb-2">
+              OR TAP FIELDERS IN ORDER
+            </Text>
+            <View className="flex-row flex-wrap gap-2">
+              {FIELDING_POSITION_NUMBERS.map((pos) => (
+                <TouchableOpacity
+                  key={pos.number}
+                  onPress={() => setSequence((prev) => [...prev, pos.number])}
+                  className="rounded-xl bg-white border border-gray-300 px-3 py-2.5 items-center"
+                  style={{ width: 84 }}
+                >
+                  <Text className="text-base font-bold text-gray-900">{pos.number}</Text>
+                  <Text className="text-[11px] text-gray-500">{pos.abbr}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+
+          <TouchableOpacity
+            onPress={() => onRecord(sequence)}
+            className="mt-5 rounded-xl py-4 items-center bg-rose-600"
+          >
+            <Text className="text-white font-bold text-base">
+              Record out{sequence.length > 0 ? ` — ${formatFieldingSequence(sequence)}` : ''}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity className="mt-2 py-3 items-center" onPress={onCancel}>
+            <Text className="text-gray-500 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+export type PickoffOutcome = 'safe' | 'out' | 'error';
+
+/**
+ * How the pickoff throw ended. Three results, and only one retires the
+ * runner — a throw that gets away moves him up instead, which is the
+ * opposite outcome and was previously unrecordable.
+ */
+function PickoffOutcomeModal({
+  runner,
+  onPick,
+  onCancel,
+}: {
+  runner: { base: 1 | 2 | 3; runnerId: string; name: string } | null;
+  onPick: (outcome: PickoffOutcome) => void;
+  onCancel: () => void;
+}) {
+  // Only meaningful from 1st or 2nd; a runner on 3rd scores, handled below.
+  const nextBase =
+    runner && runner.base < 3 ? BASE_ABBREV[(runner.base + 1) as 2 | 3] : '';
+  return (
+    <Modal visible={!!runner} transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5">
+          <Text className="text-lg font-bold text-gray-900 mb-1">
+            Pickoff at {runner ? BASE_ABBREV[runner.base] : ''}
+          </Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            {runner ? runner.name : ''} — how did the throw end?
+          </Text>
+          <View className="gap-3">
+            <PickoffChoice
+              label="Safe"
+              sub="Runner gets back. Nothing changes."
+              tone="bg-white border-slate-300"
+              textTone="text-slate-800"
+              onPress={() => onPick('safe')}
+            />
+            <PickoffChoice
+              label="Out"
+              sub="Runner is picked off."
+              tone="bg-white border-rose-300"
+              textTone="text-rose-800"
+              onPress={() => onPick('out')}
+            />
+            <PickoffChoice
+              label="Attempted, error"
+              sub={
+                runner?.base === 3
+                  ? 'Throw gets away. Runner scores, charged as an error.'
+                  : `Throw gets away. Runner takes ${nextBase}, charged as an error.`
+              }
+              tone="bg-white border-amber-300"
+              textTone="text-amber-800"
+              onPress={() => onPick('error')}
+            />
+          </View>
+          <TouchableOpacity className="mt-4 py-3 items-center" onPress={onCancel}>
+            <Text className="text-gray-500 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function PickoffChoice({
+  label,
+  sub,
+  tone,
+  textTone,
+  onPress,
+}: {
+  label: string;
+  sub: string;
+  tone: string;
+  textTone: string;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity className={`rounded-xl border px-5 py-4 ${tone}`} onPress={onPress}>
+      <Text className={`font-semibold text-base ${textTone}`}>{label}</Text>
+      <Text className="text-gray-500 text-xs mt-0.5">{sub}</Text>
+    </TouchableOpacity>
+  );
+}
+
+interface BattingOrderRow {
+  playerId: string;
+  battingOrder: number;
+  name: string;
+  /** player_position enum value, or null when the slot has no position. */
+  position: string | null;
+}
+
+/** Scorecard abbreviations for the player_position enum. */
+const POSITION_ABBREV: Record<string, string> = {
+  pitcher: 'P',
+  catcher: 'C',
+  first_base: '1B',
+  second_base: '2B',
+  third_base: '3B',
+  shortstop: 'SS',
+  left_field: 'LF',
+  center_field: 'CF',
+  right_field: 'RF',
+  designated_hitter: 'DH',
+  infield: 'IF',
+  outfield: 'OF',
+  utility: 'UT',
+};
+
+/**
+ * The batting team's order, at a glance.
+ *
+ * A scorer tracks two things between pitches: who is up, and how far the
+ * order is from turning over. Both are position in a list, so the list is
+ * the display — the batter at the plate and the hitter on deck are marked
+ * in place rather than pulled out into separate readouts.
+ */
+function BattingOrderCard({
+  title,
+  rows,
+  currentBatterId,
+  onDeckBatterId,
+  accent,
+  headerRight,
+}: {
+  title: string;
+  rows: BattingOrderRow[];
+  currentBatterId: string | null;
+  onDeckBatterId: string | null;
+  accent: 'ours' | 'theirs';
+  /** Controls for the batter at the plate, shown beside the title. */
+  headerRight?: ReactNode;
+}) {
+  if (rows.length === 0) return null;
+  // Our half and theirs read as two different cards, so the eye can tell
+  // which book it is looking at without reading the header.
+  const atBatRow = accent === 'ours' ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-100 border-slate-300';
+  const atBatText = accent === 'ours' ? 'text-emerald-900' : 'text-slate-900';
+  const slotText = accent === 'ours' ? 'text-emerald-700' : 'text-slate-600';
+  return (
+    <View className="px-4 pt-2 pb-1 border-t border-gray-100">
+      <View className="flex-row items-center mb-1">
+        <Text
+          className="flex-1 text-[11px] font-semibold text-gray-500"
+          numberOfLines={1}
+        >
+          {title}
+        </Text>
+        {headerRight}
+      </View>
+      {/* No row gap and tight padding: a ten-deep order has to fit the pane
+          without scrolling, or the scorer loses the bottom of the lineup at
+          exactly the moment the order turns over. */}
+      <View>
+        {rows.map((row) => {
+          const isAtBat = row.playerId === currentBatterId;
+          const isOnDeck = !isAtBat && row.playerId === onDeckBatterId;
+          return (
+            <View
+              key={`${row.battingOrder}-${row.playerId}`}
+              className={`flex-row items-center rounded-md px-2 py-0.5 border ${
+                isAtBat ? atBatRow : 'bg-transparent border-transparent'
+              }`}
+            >
+              <Text
+                className={`w-6 text-xs font-bold ${isAtBat ? slotText : 'text-gray-400'}`}
+              >
+                {row.battingOrder}
+              </Text>
+              <Text
+                className={`flex-1 text-[13px] ${
+                  isAtBat ? `font-bold ${atBatText}` : 'text-gray-800'
+                }`}
+                numberOfLines={1}
+              >
+                {row.name}
+              </Text>
+              {row.position && (
+                <Text className="w-7 text-[11px] text-gray-400 text-right">
+                  {POSITION_ABBREV[row.position] ?? ''}
+                </Text>
+              )}
+              <Text className={`w-16 text-[10px] font-semibold text-right ${slotText}`}>
+                {isAtBat ? 'AT BAT' : isOnDeck ? 'on deck' : ''}
+              </Text>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+/**
+ * Same rotation override as our own order, for the opposing lineup. Their
+ * batting order drifts more than ours — the scorer is reading it off a
+ * shouted announcement — so pointing at the right hitter matters.
+ */
+function OpponentBatterPickerModal({
+  visible,
+  slots,
+  dueBatterId,
+  selectedId,
+  onSelect,
+  onCancel,
+}: {
+  visible: boolean;
+  slots: OpponentBatter[];
+  dueBatterId: string | null;
+  selectedId: string | null;
+  onSelect: (playerId: string) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '75%' }}>
+          <Text className="text-lg font-bold text-gray-900 mb-1">Opponent at the plate</Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            Pick who is batting. The rotation resumes from this batter after
+            the plate appearance completes.
+          </Text>
+          <ScrollView className="max-h-96">
+            <View className="gap-2">
+              {slots.map((slot) => {
+                const isSelected = slot.playerId === selectedId;
+                const isDue = slot.playerId === dueBatterId;
+                return (
+                  <TouchableOpacity
+                    key={slot.playerId}
+                    className={`flex-row items-center rounded-xl px-4 py-3 border ${
+                      isSelected ? 'bg-slate-600 border-slate-700' : 'bg-white border-gray-300'
+                    }`}
+                    onPress={() => onSelect(slot.playerId)}
+                  >
+                    <Text className={`w-8 font-bold ${isSelected ? 'text-white' : 'text-gray-400'}`}>
+                      {slot.battingOrder}
+                    </Text>
+                    <Text className={`flex-1 font-semibold ${isSelected ? 'text-white' : 'text-gray-900'}`}>
+                      {slot.name}
+                    </Text>
+                    {isDue && (
+                      <Text className={`text-xs font-semibold ${isSelected ? 'text-slate-100' : 'text-slate-600'}`}>
+                        due up
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </ScrollView>
+          <TouchableOpacity
+            className="mt-4 rounded-xl px-5 py-3 bg-gray-100 items-center"
+            onPress={onCancel}
+          >
+            <Text className="text-gray-700 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/**
+ * Add a batter to an order mid-game — either side's.
+ *
+ * Two ways in, because a scorer meets a new batter two ways: someone already
+ * on a tracked roster, or a name and number read off a shirt. The second is
+ * the common one at the field, so it is not hidden behind the first.
+ */
+function AddBatterModal({
+  visible,
+  title,
+  rosterLabel,
+  roster,
+  onSubmit,
+  onCancel,
+}: {
+  visible: boolean;
+  title: string;
+  rosterLabel: string;
+  roster: Array<{ id: string; name: string }>;
+  onSubmit: (
+    input:
+      | { kind: 'roster'; opponentPlayerId: string }
+      | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string },
+  ) => Promise<string | null>;
+  onCancel: () => void;
+}) {
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [jersey, setJersey] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // Clear between openings so a previous entry (or error) never bleeds into
+  // the next batter the scorer adds.
+  useEffect(() => {
+    if (!visible) return;
+    setFirstName('');
+    setLastName('');
+    setJersey('');
+    setError(null);
+    setBusy(false);
+  }, [visible]);
+
+  async function run(
+    input:
+      | { kind: 'roster'; opponentPlayerId: string }
+      | { kind: 'new'; firstName: string; lastName: string; jerseyNumber: string },
+  ) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      setError(await onSubmit(input));
+    } catch (err) {
+      // A rejected write would otherwise leave busy=true, disabling every
+      // button in the modal until it is closed and reopened.
+      console.warn(`AddBatterModal submit failed title=${title}:`, err);
+      setError('Could not add the batter. Try again.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '85%' }}>
+          <Text className="text-lg font-bold text-gray-900 mb-1">{title}</Text>
+          <Text className="text-sm text-gray-500 mb-4">
+            Goes to the end of their order. Saves on the device — it reaches
+            the server whenever you have signal.
+          </Text>
+
+          {error && (
+            <View className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200">
+              <Text className="text-sm text-red-700">{error}</Text>
+            </View>
+          )}
+
+          <ScrollView className="max-h-96">
+            <Text className="text-xs font-semibold text-gray-500 mb-2">NEW BATTER</Text>
+            <View className="flex-row gap-2">
+              <TextInput
+                value={jersey}
+                onChangeText={setJersey}
+                placeholder="##"
+                keyboardType="number-pad"
+                className="w-16 rounded-xl border border-gray-300 px-3 py-3 text-base text-gray-900"
+              />
+              <TextInput
+                value={firstName}
+                onChangeText={setFirstName}
+                placeholder="First"
+                autoCapitalize="words"
+                className="flex-1 rounded-xl border border-gray-300 px-3 py-3 text-base text-gray-900"
+              />
+              <TextInput
+                value={lastName}
+                onChangeText={setLastName}
+                placeholder="Last"
+                autoCapitalize="words"
+                className="flex-1 rounded-xl border border-gray-300 px-3 py-3 text-base text-gray-900"
+              />
+            </View>
+            <TouchableOpacity
+              disabled={busy}
+              onPress={() => run({ kind: 'new', firstName, lastName, jerseyNumber: jersey })}
+              className={`mt-3 rounded-xl py-3 items-center ${busy ? 'bg-slate-300' : 'bg-slate-700'}`}
+            >
+              <Text className="text-white font-semibold">Add to order</Text>
+            </TouchableOpacity>
+            <Text className="text-xs text-gray-400 mt-2">
+              A jersey number on its own is enough — you can add the name later.
+            </Text>
+
+            {roster.length > 0 && (
+              <>
+                <Text className="text-xs font-semibold text-gray-500 mt-6 mb-2">
+                  {rosterLabel}
+                </Text>
+                <View className="gap-2">
+                  {roster.map((p) => (
+                    <TouchableOpacity
+                      key={p.id}
+                      disabled={busy}
+                      className="rounded-xl px-4 py-3 bg-white border border-slate-300"
+                      onPress={() => run({ kind: 'roster', opponentPlayerId: p.id })}
+                    >
+                      <Text className="text-slate-800 font-semibold text-base">{p.name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </>
+            )}
+          </ScrollView>
+
+          <TouchableOpacity
+            className="mt-4 rounded-xl px-5 py-3 bg-gray-100 items-center"
+            onPress={onCancel}
+          >
+            <Text className="text-gray-700 font-semibold">Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/** Checkbox-style row for the Start Game "what to track" step. */
+function TrackingToggle({
+  label,
+  hint,
+  value,
+  onToggle,
+}: {
+  label: string;
+  hint: string;
+  value: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <TouchableOpacity
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked: value }}
+      className={`flex-row items-center rounded-xl px-4 py-3 border ${
+        value ? 'bg-emerald-50 border-emerald-500' : 'bg-white border-gray-300'
+      }`}
+      onPress={onToggle}
+    >
+      <View
+        className={`w-6 h-6 rounded-md items-center justify-center mr-3 border ${
+          value ? 'bg-emerald-600 border-emerald-700' : 'bg-white border-gray-400'
+        }`}
+      >
+        {value ? <Text className="text-white text-xs font-bold">✓</Text> : null}
+      </View>
+      <View className="flex-1">
+        <Text className="text-gray-900 font-semibold">{label}</Text>
+        <Text className="text-gray-500 text-xs mt-0.5">{hint}</Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
 function LineupSetupModal({
   visible,
   roster,
@@ -1525,19 +2846,38 @@ function LineupSetupModal({
   initialPitcherId?: string | null;
   initialBatterId?: string | null;
   onCancel: () => void;
-  onSubmit: (pitcherId: string, batterId: string) => void;
+  onSubmit: (
+    pitcherId: string,
+    batterId: string,
+    tracking: { pitchType: boolean; pitchLocation: boolean },
+  ) => void;
 }) {
   const [pitcherId, setPitcherId] = useState<string | null>(null);
   const [batterId, setBatterId] = useState<string | null>(null);
+  const [step, setStep] = useState<'pitcher' | 'batter' | 'tracking'>('pitcher');
+  const [trackPitchType, setTrackPitchType] = useState(true);
+  const [trackPitchLocation, setTrackPitchLocation] = useState(false);
 
   useEffect(() => {
     if (visible) {
       setPitcherId(initialPitcherId);
       setBatterId(initialBatterId);
+      setStep('pitcher');
+      setTrackPitchType(true);
+      setTrackPitchLocation(false);
     }
   }, [visible, initialPitcherId, initialBatterId]);
 
-  const submittable = pitcherId !== null && batterId !== null;
+  const onPitcherStep = step === 'pitcher';
+  const onBatterStep = step === 'batter';
+  const onTrackingStep = step === 'tracking';
+  const selectedId = onPitcherStep ? pitcherId : batterId;
+  // The tracking step is always satisfiable — tracking nothing is a valid choice.
+  const canAdvance = onTrackingStep || selectedId !== null;
+  const stepNumber = onPitcherStep ? 1 : onBatterStep ? 2 : 3;
+  const label = (p: RosterPlayer) =>
+    `${p.jerseyNumber !== undefined ? `#${p.jerseyNumber} ` : ''}${p.name}`;
+  const pitcher = roster.find((p) => p.id === pitcherId);
 
   return (
     <Modal
@@ -1547,84 +2887,127 @@ function LineupSetupModal({
       onRequestClose={onCancel}
     >
       <View className="flex-1 justify-end bg-black/50">
-        <View className="bg-white rounded-t-2xl px-5 pb-8 pt-5" style={{ maxHeight: '85%' }}>
-          <Text className="text-lg font-bold text-gray-900 mb-1">Starting Lineup</Text>
-          <Text className="text-sm text-gray-500 mb-4">
-            Pick your starting pitcher and leadoff batter. The opponent's
-            leadoff is filled in from the web pre-game setup (or left blank
-            if not entered) — this prevents opponent at-bats from being
-            mis-credited to one of your players.
-          </Text>
+        <View className="bg-white rounded-t-2xl" style={{ maxHeight: '85%' }}>
+          {/* Header — fixed height */}
+          <View className="px-5 pt-5 pb-3">
+            <Text className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">
+              Step {stepNumber} of 3
+            </Text>
+            <Text className="text-xl font-bold text-gray-900">
+              {onPitcherStep
+                ? "Who's pitching?"
+                : onBatterStep
+                  ? "Who's batting first?"
+                  : 'What do you want to track?'}
+            </Text>
+            {!onPitcherStep && pitcher ? (
+              <Text className="text-sm text-gray-500 mt-1">
+                Pitcher: {label(pitcher)}
+              </Text>
+            ) : null}
+          </View>
 
-          {roster.length === 0 ? (
-            <Text className="text-gray-500 text-sm py-4">
+          {/* Roster — the only part that scrolls. flexShrink:1 is required:
+              React Native defaults flexShrink to 0, so without it this grows
+              past the sheet's maxHeight and pushes the footer off-screen. */}
+          {onTrackingStep ? (
+            <ScrollView className="px-5" style={{ flexShrink: 1 }}>
+              <Text className="text-sm text-gray-500 mb-4">
+                Anything you turn off is hidden while scoring, so the buttons
+                stay out of your way. You can still record the game without it.
+              </Text>
+              <View className="gap-2 pb-2">
+                <TrackingToggle
+                  label="Pitch type"
+                  hint="FB, CB, SL… tagged on each pitch"
+                  value={trackPitchType}
+                  onToggle={() => setTrackPitchType((v) => !v)}
+                />
+                <TrackingToggle
+                  label="Pitch location"
+                  hint="Where it crossed the zone, on a 3×3 grid"
+                  value={trackPitchLocation}
+                  onToggle={() => setTrackPitchLocation((v) => !v)}
+                />
+              </View>
+            </ScrollView>
+          ) : roster.length === 0 ? (
+            <Text className="text-gray-500 text-sm px-5 py-4">
               No players loaded. Sync the roster first.
             </Text>
           ) : (
-            <ScrollView className="max-h-96">
-              <Text className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                Your Starting Pitcher
-              </Text>
-              <View className="gap-2 mb-4">
-                {roster.map((p) => (
-                  <TouchableOpacity
-                    key={`pitcher-${p.id}`}
-                    className={`rounded-xl px-4 py-3 border ${
-                      pitcherId === p.id
-                        ? 'bg-blue-600 border-blue-700'
-                        : 'bg-white border-gray-300'
-                    }`}
-                    onPress={() => setPitcherId(p.id)}
-                  >
-                    <Text className={pitcherId === p.id ? 'text-white font-semibold' : 'text-gray-900 font-semibold'}>
-                      {p.jerseyNumber !== undefined ? `#${p.jerseyNumber} ` : ''}
-                      {p.name}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-
-              <Text className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                Your Leadoff Batter
-              </Text>
-              <View className="gap-2">
-                {roster.map((p) => (
-                  <TouchableOpacity
-                    key={`batter-${p.id}`}
-                    className={`rounded-xl px-4 py-3 border ${
-                      batterId === p.id
-                        ? 'bg-green-600 border-green-700'
-                        : 'bg-white border-gray-300'
-                    }`}
-                    onPress={() => setBatterId(p.id)}
-                  >
-                    <Text className={batterId === p.id ? 'text-white font-semibold' : 'text-gray-900 font-semibold'}>
-                      {p.jerseyNumber !== undefined ? `#${p.jerseyNumber} ` : ''}
-                      {p.name}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
+            <ScrollView className="px-5" style={{ flexShrink: 1 }}>
+              <View className="gap-2 pb-2">
+                {roster.map((p) => {
+                  const isSelected = selectedId === p.id;
+                  const selectedClass = onPitcherStep
+                    ? 'bg-blue-600 border-blue-700'
+                    : 'bg-green-600 border-green-700';
+                  return (
+                    <TouchableOpacity
+                      key={p.id}
+                      className={`flex-row items-center justify-between rounded-xl px-4 py-3 border ${
+                        isSelected ? selectedClass : 'bg-white border-gray-300'
+                      }`}
+                      onPress={() =>
+                        onPitcherStep ? setPitcherId(p.id) : setBatterId(p.id)
+                      }
+                    >
+                      <Text
+                        className={
+                          isSelected
+                            ? 'text-white font-semibold'
+                            : 'text-gray-900 font-semibold'
+                        }
+                      >
+                        {label(p)}
+                      </Text>
+                      {isSelected ? (
+                        <Text className="text-white font-bold">✓</Text>
+                      ) : null}
+                    </TouchableOpacity>
+                  );
+                })}
               </View>
             </ScrollView>
           )}
 
-          <View className="flex-row gap-3 mt-4">
+          {/* Footer — fixed, always reachable */}
+          <View className="flex-row gap-3 px-5 pt-3 pb-8 border-t border-gray-200">
             <TouchableOpacity
               className="flex-1 rounded-xl px-5 py-3 bg-gray-100 items-center"
-              onPress={onCancel}
+              onPress={() => {
+                if (onPitcherStep) onCancel();
+                else if (onBatterStep) setStep('pitcher');
+                else setStep('batter');
+              }}
             >
-              <Text className="text-gray-700 font-semibold">Cancel</Text>
+              <Text className="text-gray-700 font-semibold">
+                {onPitcherStep ? 'Cancel' : 'Back'}
+              </Text>
             </TouchableOpacity>
             <TouchableOpacity
-              className={`flex-1 rounded-xl px-5 py-3 items-center ${submittable ? 'bg-emerald-600' : 'bg-emerald-300'}`}
-              disabled={!submittable}
+              className={`flex-1 rounded-xl px-5 py-3 items-center ${
+                canAdvance ? 'bg-emerald-600' : 'bg-emerald-300'
+              }`}
+              disabled={!canAdvance}
               onPress={() => {
-                if (submittable && pitcherId && batterId) {
-                  onSubmit(pitcherId, batterId);
+                if (!canAdvance) return;
+                if (onPitcherStep) {
+                  setStep('batter');
+                } else if (onBatterStep) {
+                  setStep('tracking');
+                } else if (pitcherId && batterId) {
+                  onSubmit(pitcherId, batterId, {
+                    pitchType: trackPitchType,
+                    pitchLocation: trackPitchLocation,
+                  });
                 }
               }}
             >
-              <Text className="text-white font-semibold">Start Game</Text>
+              <Text className="text-white font-semibold">
+                {onTrackingStep ? 'Start Game' : 'Next'}
+              </Text>
             </TouchableOpacity>
           </View>
         </View>

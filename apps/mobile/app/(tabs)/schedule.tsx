@@ -1,6 +1,6 @@
-import { Stack, Link } from 'expo-router';
+import { Stack, router, type Href } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, FlatList, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, Text, TouchableOpacity, View } from 'react-native';
 import { getSupabaseClient } from '../../src/lib/supabase';
 import { useRole } from '../../src/providers/RoleProvider';
 
@@ -10,7 +10,7 @@ type ScheduleItem = {
   startsAt: string;
   title: string;
   detail: string | null;
-  href?: string;
+  href?: Href;
 };
 
 export default function ScheduleScreen() {
@@ -63,8 +63,18 @@ export default function ScheduleScreen() {
           startsAt: game.scheduled_at,
           title: `Game vs ${game.opponent_name ?? 'TBD'}`,
           detail: game.status,
-          href: game.status === 'in_progress'
-            ? `/(tabs)/games/[gameId]/score?gameId=${game.id}&teamId=${activeTeam.teamId}`
+          // Scheduled games open in the pre-game state (start the game at
+          // the field), live games in the scoring surface, and completed
+          // games in the read-only Final view — same as the Games tab.
+          href: ['scheduled', 'in_progress', 'completed'].includes(game.status)
+            ? ({
+                pathname: '/(tabs)/games/[gameId]/score',
+                params: {
+                  gameId: game.id,
+                  teamId: activeTeam.teamId,
+                  opponentName: game.opponent_name || 'TBD',
+                },
+              } as const)
             : undefined,
         })),
         ...(practices.data ?? []).map((practice) => ({
@@ -109,17 +119,31 @@ export default function ScheduleScreen() {
         data={items}
         keyExtractor={(item) => item.id}
         renderItem={({ item }) => {
-          const card = (
-            <View className="mb-2 rounded-xl border border-gray-200 bg-white px-4 py-3">
+          const content = (
+            <>
               <Text className="text-xs font-semibold uppercase text-gray-500">{item.kind}</Text>
               <Text className="mt-1 font-semibold text-gray-900">{item.title}</Text>
               <Text className="mt-1 text-sm text-gray-600">
                 {new Date(item.startsAt).toLocaleString()}
               </Text>
               {item.detail ? <Text className="mt-1 text-xs text-gray-500">{item.detail}</Text> : null}
-            </View>
+            </>
           );
-          return item.href ? <Link href={item.href as never}>{card}</Link> : card;
+          if (!item.href) {
+            return (
+              <View className="mb-2 rounded-xl border border-gray-200 bg-white px-4 py-3">
+                {content}
+              </View>
+            );
+          }
+          return (
+            <TouchableOpacity
+              className="mb-2 rounded-xl border border-gray-200 bg-white px-4 py-3"
+              onPress={() => router.push(item.href!)}
+            >
+              {content}
+            </TouchableOpacity>
+          );
         }}
         ListEmptyComponent={<Text className="py-10 text-center text-gray-500">No upcoming events.</Text>}
       />

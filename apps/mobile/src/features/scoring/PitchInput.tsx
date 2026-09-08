@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, Modal } from 'react-native';
 import { HitType, PitchOutcome, PitchType } from '@baseball/shared';
 import type { DefensiveLineup, DroppedThirdStrikeOutcome } from '@baseball/shared';
@@ -47,7 +47,16 @@ export type RunnerOutcome = {
 );
 
 interface PitchInputProps {
-  onRecordPitch: (outcome: PitchOutcome, pitchType?: PitchType) => void;
+  onRecordPitch: (
+    outcome: PitchOutcome,
+    pitchType?: PitchType,
+    zoneLocation?: number,
+  ) => void;
+  /** Scorer opted into pitch-type tracking at game start. When false the
+   *  picker is hidden entirely rather than shown-and-ignored. */
+  trackPitchType?: boolean;
+  /** Scorer opted into pitch-location tracking at game start. */
+  trackPitchLocation?: boolean;
   onRecordHit: (hitType: HitType) => void;
   /**
    * Optional: when present and the scorer taps 2B / 3B with runners on base,
@@ -136,20 +145,14 @@ const HIT_TYPES: Array<{ label: string; emoji: string; hitType: HitType; color: 
   { label: 'HR', emoji: '💥', hitType: HitType.HOME_RUN, color: 'bg-amber-600' },
 ];
 
-const PITCH_OUTCOMES: Array<{ label: string; outcome: PitchOutcome; color: string }> = [
-  { label: 'Called ⚾', outcome: PitchOutcome.CALLED_STRIKE, color: 'bg-red-100 border-red-300 text-red-700' },
-  { label: 'Swing K', outcome: PitchOutcome.SWINGING_STRIKE, color: 'bg-red-100 border-red-300 text-red-700' },
-  { label: 'Ball', outcome: PitchOutcome.BALL, color: 'bg-green-100 border-green-300 text-green-700' },
-  { label: 'Foul', outcome: PitchOutcome.FOUL, color: 'bg-yellow-100 border-yellow-300 text-yellow-700' },
-  { label: 'HBP', outcome: PitchOutcome.HIT_BY_PITCH, color: 'bg-orange-100 border-orange-300 text-orange-700' },
-];
-
 /**
  * Primary pitch and plate-appearance input interface.
  * Records individual pitches (ball/strike/foul) and plate outcomes (hit/out/walk/K).
  */
 export function PitchInput({
   onRecordPitch,
+  trackPitchType = true,
+  trackPitchLocation = false,
   onRecordHit,
   onRecordHitWithRunnerOutcomes,
   onRecordOut,
@@ -207,11 +210,33 @@ export function PitchInput({
   const [defSubInId, setDefSubInId] = useState<string>('');
   const [defSubPosition, setDefSubPosition] = useState<string>('');
   const [selectedPitchType, setSelectedPitchType] = useState<PitchType | null>(null);
+  // Strike-zone cell 1-9, or 0 for a pitch outside the zone. null = not picked.
+  const [selectedZone, setSelectedZone] = useState<number | null>(null);
+  // Branch sheets opened from the primary surface.
+  const [showInPlaySheet, setShowInPlaySheet] = useState(false);
+  const [showRunnersSheet, setShowRunnersSheet] = useState(false);
+  const [showSubsSheet, setShowSubsSheet] = useState(false);
   const fcEligible = runnersOnBase.length > 0;
 
+  /**
+   * Close the branch sheet, then run the action. Several actions open a
+   * follow-up modal (Out, Error, Fielder's Choice…) and two Modals visible
+   * at once stack awkwardly on iOS, so the sheet always closes first.
+   */
+  function runFromSheet(close: (open: boolean) => void, action: () => void) {
+    close(false);
+    action();
+  }
+
   function handlePitchOutcome(outcome: PitchOutcome) {
-    onRecordPitch(outcome, selectedPitchType ?? undefined);
+    onRecordPitch(
+      outcome,
+      trackPitchType ? selectedPitchType ?? undefined : undefined,
+      trackPitchLocation ? selectedZone ?? undefined : undefined,
+    );
+    // Both selections latch only until the pitch is recorded.
     setSelectedPitchType(null);
+    setSelectedZone(null);
   }
 
   function handleErrorPick(errorBy: number) {
@@ -375,133 +400,188 @@ export function PitchInput({
   }
 
   return (
-    <ScrollView className="flex-1 bg-gray-50">
-      {/* Undo — voids the most recent live event (EVENT_VOIDED) */}
-      <View className="px-4 pt-3 flex-row justify-end">
-        <TouchableOpacity
-          className="border border-gray-300 bg-white rounded-lg px-3 py-1.5"
-          onPress={onUndoLastEvent}
-        >
-          <Text className="text-xs font-semibold text-gray-700">↩ Undo</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Pitch type picker — optional; latches until the next recorded pitch */}
-      <View className="px-4 pt-3">
-        <Text className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-          Pitch type (optional)
-        </Text>
-        <View className="flex-row flex-wrap gap-1.5">
-          {PITCH_TYPES.map(({ label, value }) => {
-            const selected = selectedPitchType === value;
-            return (
-              <TouchableOpacity
-                key={value}
-                className={`rounded-lg px-3 py-1.5 border ${
-                  selected ? 'bg-slate-800 border-slate-900' : 'bg-white border-gray-300'
-                }`}
-                onPress={() => setSelectedPitchType(selected ? null : value)}
-              >
-                <Text className={`text-xs font-semibold ${selected ? 'text-white' : 'text-gray-700'}`}>
-                  {label}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-      </View>
-
-      {/* Pitch-by-pitch section */}
-      <View className="px-4 pt-4">
-        <Text className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-          Record pitch
-        </Text>
-        <View className="flex-row flex-wrap gap-2">
-          {PITCH_OUTCOMES.map(({ label, outcome, color }) => (
-            <TouchableOpacity
-              key={outcome}
-              className={`border rounded-xl px-4 py-3 ${color}`}
-              onPress={() => handlePitchOutcome(outcome)}
-            >
-              <Text className="font-semibold text-sm">{label}</Text>
-            </TouchableOpacity>
-          ))}
-          <TouchableOpacity
-            className="border rounded-xl px-4 py-3 bg-amber-100 border-amber-300"
-            onPress={onRecordWildPitch}
-          >
-            <Text className="font-semibold text-sm text-amber-700">WP</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            className="border rounded-xl px-4 py-3 bg-yellow-100 border-yellow-300"
-            onPress={onRecordPassedBall}
-          >
-            <Text className="font-semibold text-sm text-yellow-700">PB</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Hit type — OBR 9.06 requires explicit 1B/2B/3B/HR */}
-      <View className="px-4 pt-5">
-        <Text className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-          Hit
-        </Text>
-        <View className="flex-row flex-wrap gap-2">
-          {HIT_TYPES.map(({ label, emoji, hitType, color }) => (
-            <OutcomeButton
-              key={hitType}
-              label={label}
-              emoji={emoji}
-              onPress={() => handleHitTap(hitType)}
-              color={color}
-            />
-          ))}
-        </View>
-      </View>
-
-      {/* Other plate appearance outcomes */}
-      <View className="px-4 pt-5">
-        <Text className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-          Other plate appearance result
-        </Text>
-        <View className="flex-row flex-wrap gap-2">
-          <OutcomeButton label="Out" emoji="✋" onPress={() => setShowOutModal(true)} color="bg-gray-600" />
-          <OutcomeButton label="Error" emoji="E" onPress={() => setShowErrorModal(true)} color="bg-orange-600" />
-          <OutcomeButton label="Catcher Int." emoji="CI" onPress={onRecordCatcherInterference} color="bg-rose-500" />
-          <OutcomeButton label="Sac Fly" emoji="SF" onPress={onRecordSacFly} color="bg-teal-600" />
-          <OutcomeButton label="Sac Bunt" emoji="SH" onPress={onRecordSacBunt} color="bg-teal-700" />
-          {fcEligible && (
-            <OutcomeButton
-              label="Fielder's Choice"
-              emoji="FC"
-              onPress={() => setShowFCModal(true)}
-              color="bg-purple-700"
-            />
+    <View className="flex-1 bg-slate-50">
+      {/* Modifiers — only rendered when the scorer opted in at game start.
+          Placed directly above the outcome buttons so the thumb travels
+          modifier → outcome in the order a pitch is actually observed. */}
+      {(trackPitchType || trackPitchLocation) && (
+        <ScrollView className="px-4 pt-3" style={{ flexShrink: 1 }}>
+          {trackPitchType && (
+            <View className="mb-3">
+              <Text className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
+                Pitch type
+              </Text>
+              <View className="flex-row flex-wrap gap-1.5">
+                {PITCH_TYPES.map(({ label, value }) => {
+                  const selected = selectedPitchType === value;
+                  return (
+                    <TouchableOpacity
+                      key={value}
+                      className={`rounded-lg px-3 py-2 border ${
+                        selected ? 'bg-slate-800 border-slate-900' : 'bg-white border-slate-300'
+                      }`}
+                      onPress={() => setSelectedPitchType(selected ? null : value)}
+                    >
+                      <Text
+                        className={`text-xs font-bold tracking-wide ${
+                          selected ? 'text-white' : 'text-slate-600'
+                        }`}
+                      >
+                        {label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
           )}
-          {fcEligible && (
-            <OutcomeButton
-              label="Runner Out"
-              emoji="RO"
-              onPress={() => setShowRunnerOutModal(true)}
-              color="bg-rose-700"
-            />
+
+          {trackPitchLocation && (
+            <View className="mb-2">
+              <Text className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
+                Location
+              </Text>
+              <StrikeZoneGrid selected={selectedZone} onSelect={setSelectedZone} />
+            </View>
           )}
-          <OutcomeButton label="Balk" emoji="BK" onPress={onRecordBalk} color="bg-pink-600" />
-          <OutcomeButton label="Double Play" emoji="DP" onPress={handleDPTap} color="bg-zinc-700" />
-          <OutcomeButton label="Triple Play" emoji="TP" onPress={onRecordTriplePlay} color="bg-zinc-800" />
-          <OutcomeButton label="Pinch Hitter" emoji="PH" onPress={() => setSubModal('pinch_hitter')} color="bg-sky-700" />
-          <OutcomeButton label="Pitching Change" emoji="🔄" onPress={() => setSubModal('pitching_change')} color="bg-sky-800" />
+        </ScrollView>
+      )}
+
+      {/* Primary outcomes — pinned to the bottom of the screen, never
+          scrolls. Ball/strike/foul is the overwhelming majority of taps in
+          a live game, so it stays one tap away and inside thumb reach.
+          Everything a batted ball can become lives behind "In play". */}
+      <View className="mt-auto px-3 pt-2">
+        <View className="flex-row gap-2 mb-2">
+          <PrimaryAction
+            label="Ball"
+            tone="ball"
+            onPress={() => handlePitchOutcome(PitchOutcome.BALL)}
+          />
+          <PrimaryAction
+            label="Foul"
+            tone="foul"
+            onPress={() => handlePitchOutcome(PitchOutcome.FOUL)}
+          />
+        </View>
+        <View className="flex-row gap-2 mb-2">
+          <PrimaryAction
+            label="Called"
+            caption="strike"
+            tone="strike"
+            onPress={() => handlePitchOutcome(PitchOutcome.CALLED_STRIKE)}
+          />
+          <PrimaryAction
+            label="Swinging"
+            caption="strike"
+            tone="strike"
+            onPress={() => handlePitchOutcome(PitchOutcome.SWINGING_STRIKE)}
+          />
+        </View>
+        <PrimaryAction
+          label="In play"
+          caption="hit · out · reached"
+          tone="inPlay"
+          full
+          onPress={() => setShowInPlaySheet(true)}
+        />
+      </View>
+
+      {/* Everything infrequent — one row of sheets, out of the hot path. */}
+      <View className="flex-row gap-2 px-3 pt-2 pb-3">
+        <BranchButton label="Runners" onPress={() => setShowRunnersSheet(true)} />
+        <BranchButton label="Subs" onPress={() => setShowSubsSheet(true)} />
+        <BranchButton label="↩ Undo" onPress={onUndoLastEvent} />
+      </View>
+
+      {/* In play — what the batted ball became. Grouped the way a scorer
+          thinks about it: did the batter hit safely, make an out, or reach
+          without a hit? */}
+      <ActionSheet
+        visible={showInPlaySheet}
+        title="In play"
+        subtitle="What happened to the batter?"
+        onClose={() => setShowInPlaySheet(false)}
+      >
+        <SheetGroup label="Hit">
+          <View className="flex-row flex-wrap gap-2">
+            {HIT_TYPES.map(({ label, emoji, hitType, color }) => (
+              <OutcomeButton
+                key={hitType}
+                label={label}
+                emoji={emoji}
+                onPress={() => runFromSheet(setShowInPlaySheet, () => handleHitTap(hitType))}
+                color={color}
+              />
+            ))}
+          </View>
+        </SheetGroup>
+
+        <SheetGroup label="Out">
+          <View className="flex-row flex-wrap gap-2">
+            <OutcomeButton label="Out" emoji="✋" onPress={() => runFromSheet(setShowInPlaySheet, () => setShowOutModal(true))} color="bg-gray-600" />
+            <OutcomeButton label="Sac Fly" emoji="SF" onPress={() => runFromSheet(setShowInPlaySheet, onRecordSacFly)} color="bg-teal-600" />
+            <OutcomeButton label="Sac Bunt" emoji="SH" onPress={() => runFromSheet(setShowInPlaySheet, onRecordSacBunt)} color="bg-teal-700" />
+            <OutcomeButton label="Double Play" emoji="DP" onPress={() => runFromSheet(setShowInPlaySheet, handleDPTap)} color="bg-zinc-700" />
+            <OutcomeButton label="Triple Play" emoji="TP" onPress={() => runFromSheet(setShowInPlaySheet, onRecordTriplePlay)} color="bg-zinc-800" />
+          </View>
+        </SheetGroup>
+
+        <SheetGroup label="Reached base">
+          <View className="flex-row flex-wrap gap-2">
+            <OutcomeButton label="Error" emoji="E" onPress={() => runFromSheet(setShowInPlaySheet, () => setShowErrorModal(true))} color="bg-orange-600" />
+            <OutcomeButton label="Hit by pitch" emoji="HBP" onPress={() => runFromSheet(setShowInPlaySheet, () => handlePitchOutcome(PitchOutcome.HIT_BY_PITCH))} color="bg-orange-500" />
+            <OutcomeButton label="Catcher Int." emoji="CI" onPress={() => runFromSheet(setShowInPlaySheet, onRecordCatcherInterference)} color="bg-rose-500" />
+            {fcEligible && (
+              <OutcomeButton label="Fielder's Choice" emoji="FC" onPress={() => runFromSheet(setShowInPlaySheet, () => setShowFCModal(true))} color="bg-purple-700" />
+            )}
+          </View>
+        </SheetGroup>
+      </ActionSheet>
+
+      {/* Runners — plays that move or retire runners without a batted ball. */}
+      <ActionSheet
+        visible={showRunnersSheet}
+        title="Runners"
+        subtitle="Plays that don't involve the batter"
+        onClose={() => setShowRunnersSheet(false)}
+      >
+        <View className="flex-row flex-wrap gap-2">
+          <OutcomeButton label="Wild Pitch" emoji="WP" onPress={() => runFromSheet(setShowRunnersSheet, onRecordWildPitch)} color="bg-amber-600" />
+          <OutcomeButton label="Passed Ball" emoji="PB" onPress={() => runFromSheet(setShowRunnersSheet, onRecordPassedBall)} color="bg-yellow-600" />
+          <OutcomeButton label="Balk" emoji="BK" onPress={() => runFromSheet(setShowRunnersSheet, onRecordBalk)} color="bg-pink-600" />
+          {fcEligible && (
+            <OutcomeButton label="Runner Out" emoji="RO" onPress={() => runFromSheet(setShowRunnersSheet, () => setShowRunnerOutModal(true))} color="bg-rose-700" />
+          )}
+        </View>
+        {!fcEligible && (
+          <Text className="text-slate-400 text-xs mt-3">
+            Runner plays appear here once someone is on base.
+          </Text>
+        )}
+      </ActionSheet>
+
+      {/* Subs — roster changes. */}
+      <ActionSheet
+        visible={showSubsSheet}
+        title="Substitutions"
+        subtitle="Change who's in the game"
+        onClose={() => setShowSubsSheet(false)}
+      >
+        <View className="flex-row flex-wrap gap-2">
+          <OutcomeButton label="Pinch Hitter" emoji="PH" onPress={() => runFromSheet(setShowSubsSheet, () => setSubModal('pinch_hitter'))} color="bg-sky-700" />
+          <OutcomeButton label="Pitching Change" emoji="🔄" onPress={() => runFromSheet(setShowSubsSheet, () => setSubModal('pitching_change'))} color="bg-sky-800" />
           {onRecordDefensiveSub && (
-            <OutcomeButton label="Defensive Sub" emoji="DS" onPress={openDefensiveSubModal} color="bg-sky-900" />
+            <OutcomeButton label="Defensive Sub" emoji="DS" onPress={() => runFromSheet(setShowSubsSheet, openDefensiveSubModal)} color="bg-sky-900" />
           )}
           {onRecordPositionChange && (
-            <OutcomeButton label="Position Change" emoji="↔" onPress={openPositionChangeModal} color="bg-indigo-700" />
+            <OutcomeButton label="Position Change" emoji="↔" onPress={() => runFromSheet(setShowSubsSheet, openPositionChangeModal)} color="bg-indigo-700" />
           )}
           {onRecordAddBatter && (
-            <OutcomeButton label="Add Batter" emoji="+" onPress={() => setSubModal('add_batter')} color="bg-emerald-700" />
+            <OutcomeButton label="Add Batter" emoji="+" onPress={() => runFromSheet(setShowSubsSheet, () => setSubModal('add_batter'))} color="bg-emerald-700" />
           )}
         </View>
-      </View>
+      </ActionSheet>
 
       {/* Dropped third strike outcome modal */}
       <Modal
@@ -521,66 +601,66 @@ export function PitchInput({
 
             <View className="gap-3">
               <TouchableOpacity
-                className="bg-red-600 rounded-xl px-5 py-4"
+                className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                 onPress={() => {
                   setShowD3KModal(false);
                   onRecordStrikeout();
                 }}
               >
-                <Text className="text-white font-semibold">Caught (regular K)</Text>
-                <Text className="text-white/70 text-xs mt-0.5">
+                <Text className="text-slate-800 font-semibold">Caught (regular K)</Text>
+                <Text className="text-slate-500 text-xs mt-0.5">
                   Catcher caught the third strike — batter is out
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                className="bg-gray-600 rounded-xl px-5 py-4"
+                className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                 onPress={() => handleD3KOutcome({
                   outcome: 'thrown_out',
                   fieldingSequence: [2, 3],
                 })}
               >
-                <Text className="text-white font-semibold">Batter Out (K 2-3)</Text>
-                <Text className="text-white/70 text-xs mt-0.5">
+                <Text className="text-slate-800 font-semibold">Batter Out (K 2-3)</Text>
+                <Text className="text-slate-500 text-xs mt-0.5">
                   Catcher threw batter out at first
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                className="bg-orange-600 rounded-xl px-5 py-4"
+                className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                 onPress={() => handleD3KOutcome({
                   outcome: 'reached_on_error',
                   errorBy: 2,
                 })}
               >
-                <Text className="text-white font-semibold">Safe - Error</Text>
-                <Text className="text-white/70 text-xs mt-0.5">
+                <Text className="text-slate-800 font-semibold">Safe - Error</Text>
+                <Text className="text-slate-500 text-xs mt-0.5">
                   Batter reached on fielding error
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                className="bg-amber-600 rounded-xl px-5 py-4"
+                className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                 onPress={() => handleD3KOutcome({
                   outcome: 'reached_wild_pitch',
                   isWildPitch: true,
                 })}
               >
-                <Text className="text-white font-semibold">Safe - Wild Pitch</Text>
-                <Text className="text-white/70 text-xs mt-0.5">
+                <Text className="text-slate-800 font-semibold">Safe - Wild Pitch</Text>
+                <Text className="text-slate-500 text-xs mt-0.5">
                   Batter reached on wild pitch
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                className="bg-yellow-600 rounded-xl px-5 py-4"
+                className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                 onPress={() => handleD3KOutcome({
                   outcome: 'reached_wild_pitch',
                   isWildPitch: false,
                 })}
               >
-                <Text className="text-white font-semibold">Safe - Passed Ball</Text>
-                <Text className="text-white/70 text-xs mt-0.5">
+                <Text className="text-slate-800 font-semibold">Safe - Passed Ball</Text>
+                <Text className="text-slate-500 text-xs mt-0.5">
                   Batter reached on passed ball
                 </Text>
               </TouchableOpacity>
@@ -613,10 +693,10 @@ export function PitchInput({
               {runnersOnBase.map(({ base, runnerId }) => (
                 <TouchableOpacity
                   key={base}
-                  className="bg-zinc-700 rounded-xl px-5 py-4"
+                  className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                   onPress={() => handleDPPick(runnerId, base)}
                 >
-                  <Text className="text-white font-semibold">
+                  <Text className="text-slate-800 font-semibold">
                     Runner on {base === 1 ? '1st' : base === 2 ? '2nd' : '3rd'} retired
                   </Text>
                 </TouchableOpacity>
@@ -646,10 +726,10 @@ export function PitchInput({
               {FIELDER_POSITIONS.map(({ label, position }) => (
                 <TouchableOpacity
                   key={position}
-                  className="bg-orange-600 rounded-xl px-4 py-3"
+                  className="bg-white border border-slate-300 rounded-xl px-4 py-3"
                   onPress={() => handleErrorPick(position)}
                 >
-                  <Text className="text-white font-semibold">
+                  <Text className="text-slate-800 font-semibold">
                     {position} — {label}
                   </Text>
                 </TouchableOpacity>
@@ -714,8 +794,12 @@ export function PitchInput({
                     </Text>
                   );
                 }
+                // Player rows are a list to scan, not a wall of colour — the
+                // accent lives on the left edge instead of filling the row.
                 const buttonColor =
-                  subModal === 'add_batter' ? 'bg-emerald-700' : 'bg-sky-700';
+                  subModal === 'add_batter'
+                    ? 'bg-white border border-emerald-300'
+                    : 'bg-white border border-sky-300';
                 return (
                   <View className="gap-2">
                     {filteredRoster.map((p) => {
@@ -730,7 +814,7 @@ export function PitchInput({
                           className={`${buttonColor} rounded-xl px-4 py-3 flex-row items-center`}
                           onPress={() => handleSubPick(p.id)}
                         >
-                          <Text className="flex-1 text-white font-semibold text-base">
+                          <Text className="flex-1 text-slate-800 font-semibold text-base">
                             {p.jerseyNumber !== undefined ? `#${p.jerseyNumber} ` : ''}
                             {p.name}
                           </Text>
@@ -741,7 +825,7 @@ export function PitchInput({
                                   ? 'bg-red-200'
                                   : badge.level === 'warning'
                                     ? 'bg-amber-200'
-                                    : 'bg-white/20'
+                                    : 'bg-slate-100'
                               }`}
                             >
                               <Text
@@ -750,7 +834,7 @@ export function PitchInput({
                                     ? 'text-red-900'
                                     : badge.level === 'warning'
                                       ? 'text-amber-900'
-                                      : 'text-white'
+                                      : 'text-slate-600'
                                 }`}
                               >
                                 {badge.count}p{badge.level === 'over' ? ' • over limit' : badge.level === 'danger' ? ' • at limit' : ''}
@@ -819,7 +903,7 @@ export function PitchInput({
                   }
                   onPress={subModal === 'defensive' ? submitDefensiveSub : submitPositionChange}
                 >
-                  <Text className="text-white font-semibold">Record</Text>
+                  <Text className="text-slate-800 font-semibold">Record</Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -852,20 +936,20 @@ export function PitchInput({
                 </Text>
 
                 <View className="gap-3">
-                  <TouchableOpacity className="bg-gray-600 rounded-xl px-5 py-4" onPress={() => handleOutPick('groundout')}>
-                    <Text className="text-white font-semibold">Groundout</Text>
+                  <TouchableOpacity className="bg-white border border-slate-300 rounded-xl px-5 py-4" onPress={() => handleOutPick('groundout')}>
+                    <Text className="text-slate-800 font-semibold">Groundout</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity className="bg-gray-600 rounded-xl px-5 py-4" onPress={() => handleOutPick('flyout')}>
-                    <Text className="text-white font-semibold">Flyout</Text>
+                  <TouchableOpacity className="bg-white border border-slate-300 rounded-xl px-5 py-4" onPress={() => handleOutPick('flyout')}>
+                    <Text className="text-slate-800 font-semibold">Flyout</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity className="bg-gray-600 rounded-xl px-5 py-4" onPress={() => handleOutPick('lineout')}>
-                    <Text className="text-white font-semibold">Lineout</Text>
+                  <TouchableOpacity className="bg-white border border-slate-300 rounded-xl px-5 py-4" onPress={() => handleOutPick('lineout')}>
+                    <Text className="text-slate-800 font-semibold">Lineout</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity className="bg-gray-600 rounded-xl px-5 py-4" onPress={() => handleOutPick('popout')}>
-                    <Text className="text-white font-semibold">Popout</Text>
+                  <TouchableOpacity className="bg-white border border-slate-300 rounded-xl px-5 py-4" onPress={() => handleOutPick('popout')}>
+                    <Text className="text-slate-800 font-semibold">Popout</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity className="bg-gray-500 rounded-xl px-5 py-4" onPress={() => handleOutPick('other')}>
-                    <Text className="text-white font-semibold">Other</Text>
+                  <TouchableOpacity className="bg-white border border-slate-300 rounded-xl px-5 py-4" onPress={() => handleOutPick('other')}>
+                    <Text className="text-slate-800 font-semibold">Other</Text>
                   </TouchableOpacity>
                 </View>
 
@@ -885,31 +969,31 @@ export function PitchInput({
 
                 <View className="gap-3">
                   <TouchableOpacity
-                    className="bg-gray-700 rounded-xl px-5 py-4"
+                    className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                     onPress={confirmRegularOut}
                   >
-                    <Text className="text-white font-semibold">Regular out</Text>
-                    <Text className="text-white/70 text-xs mt-0.5">
+                    <Text className="text-slate-800 font-semibold">Regular out</Text>
+                    <Text className="text-slate-500 text-xs mt-0.5">
                       Records a normal {outTypeLabel(pendingOutType).toLowerCase()} (counts as an at-bat)
                     </Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    className="bg-teal-600 rounded-xl px-5 py-4"
+                    className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                     onPress={confirmSacFlyFromOut}
                   >
-                    <Text className="text-white font-semibold">Sacrifice fly</Text>
-                    <Text className="text-white/70 text-xs mt-0.5">
+                    <Text className="text-slate-800 font-semibold">Sacrifice fly</Text>
+                    <Text className="text-slate-500 text-xs mt-0.5">
                       Runner scored from 3rd on the catch — PA but not an AB
                     </Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    className="bg-teal-700 rounded-xl px-5 py-4"
+                    className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                     onPress={confirmSacBuntFromOut}
                   >
-                    <Text className="text-white font-semibold">Sacrifice bunt</Text>
-                    <Text className="text-white/70 text-xs mt-0.5">
+                    <Text className="text-slate-800 font-semibold">Sacrifice bunt</Text>
+                    <Text className="text-slate-500 text-xs mt-0.5">
                       Bunt out that intentionally advanced a runner — PA but not an AB
                     </Text>
                   </TouchableOpacity>
@@ -949,10 +1033,10 @@ export function PitchInput({
               {runnersOnBase.map(({ base, runnerId }) => (
                 <TouchableOpacity
                   key={base}
-                  className="bg-purple-700 rounded-xl px-5 py-4"
+                  className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                   onPress={() => handleFCPick(runnerId, base)}
                 >
-                  <Text className="text-white font-semibold">
+                  <Text className="text-slate-800 font-semibold">
                     Runner on {baseLabel(base)} retired
                   </Text>
                 </TouchableOpacity>
@@ -991,10 +1075,10 @@ export function PitchInput({
               {runnersOnBase.map(({ base, runnerId }) => (
                 <TouchableOpacity
                   key={base}
-                  className="bg-rose-700 rounded-xl px-5 py-4"
+                  className="bg-white border border-slate-300 rounded-xl px-5 py-4"
                   onPress={() => handleRunnerOutPick(runnerId, base)}
                 >
-                  <Text className="text-white font-semibold">
+                  <Text className="text-slate-800 font-semibold">
                     Runner on {baseLabel(base)} thrown out
                   </Text>
                 </TouchableOpacity>
@@ -1046,7 +1130,7 @@ export function PitchInput({
                     </Text>
                     <View className="flex-row flex-wrap gap-2">
                       <TouchableOpacity
-                        className={`px-3 py-2 rounded-lg ${kind === 'auto' ? 'bg-blue-600' : 'bg-gray-200'}`}
+                        className={`px-3 py-2 rounded-lg ${kind === 'auto' ? 'bg-slate-700' : 'bg-slate-100'}`}
                         onPress={() => setRunnerChoice(runnerId, base, 'auto')}
                       >
                         <Text className={kind === 'auto' ? 'text-white font-semibold' : 'text-gray-700'}>
@@ -1055,7 +1139,7 @@ export function PitchInput({
                       </TouchableOpacity>
                       {canHold && (
                         <TouchableOpacity
-                          className={`px-3 py-2 rounded-lg ${kind === 'held' ? 'bg-amber-600' : 'bg-gray-200'}`}
+                          className={`px-3 py-2 rounded-lg ${kind === 'held' ? 'bg-amber-600' : 'bg-slate-100'}`}
                           onPress={() => setRunnerChoice(runnerId, base, 'held')}
                         >
                           <Text className={kind === 'held' ? 'text-white font-semibold' : 'text-gray-700'}>
@@ -1064,7 +1148,7 @@ export function PitchInput({
                         </TouchableOpacity>
                       )}
                       <TouchableOpacity
-                        className={`px-3 py-2 rounded-lg ${kind === 'thrown_out' ? 'bg-rose-700' : 'bg-gray-200'}`}
+                        className={`px-3 py-2 rounded-lg ${kind === 'thrown_out' ? 'bg-rose-700' : 'bg-slate-100'}`}
                         onPress={() => setRunnerChoice(runnerId, base, 'thrown_out')}
                       >
                         <Text className={kind === 'thrown_out' ? 'text-white font-semibold' : 'text-gray-700'}>
@@ -1078,7 +1162,7 @@ export function PitchInput({
             </ScrollView>
 
             <TouchableOpacity
-              className="bg-blue-600 rounded-xl px-5 py-4 mt-2"
+              className="bg-slate-800 rounded-xl px-5 py-4 mt-2"
               onPress={confirmHitWithRunners}
             >
               <Text className="text-white font-semibold text-center">
@@ -1094,7 +1178,185 @@ export function PitchInput({
           </View>
         </View>
       </Modal>
-    </ScrollView>
+    </View>
+  );
+}
+
+/**
+ * A primary pitch outcome. Deliberately oversized: these are tapped dozens
+ * of times a game, often one-handed, outdoors, without looking down for
+ * long. Big target and high-contrast fill beat visual restraint here.
+ */
+/**
+ * Tinted surfaces rather than saturated fills: the buttons still read at a
+ * glance and keep their semantic colour (safe / strike / neither), but sit
+ * quietly next to the rest of the app's white-card UI.
+ */
+const TONES = {
+  ball: { box: 'bg-emerald-50 border-emerald-300', text: 'text-emerald-900' },
+  foul: { box: 'bg-amber-50 border-amber-300', text: 'text-amber-900' },
+  strike: { box: 'bg-rose-50 border-rose-300', text: 'text-rose-900' },
+  inPlay: { box: 'bg-slate-100 border-slate-400', text: 'text-slate-900' },
+} as const;
+
+function PrimaryAction({
+  label,
+  caption,
+  tone,
+  onPress,
+  full,
+}: {
+  label: string;
+  caption?: string;
+  tone: keyof typeof TONES;
+  onPress: () => void;
+  /** Full-width row of its own. Without this the button uses flex-1 to share
+   *  a row; as a lone child of the column that would instead make it grow and
+   *  shrink vertically, squashing the label out of view. */
+  full?: boolean;
+}) {
+  const { box, text } = TONES[tone];
+  return (
+    <TouchableOpacity
+      className={`${box} border ${full ? 'w-full' : 'flex-1'} rounded-2xl py-4 items-center justify-center`}
+      activeOpacity={0.7}
+      onPress={onPress}
+    >
+      <Text className={`${text} text-lg font-bold tracking-tight`}>{label}</Text>
+      {caption ? (
+        <Text className={`${text} opacity-60 text-[11px] mt-0.5`}>{caption}</Text>
+      ) : null}
+    </TouchableOpacity>
+  );
+}
+
+/** Opens one of the infrequent-action sheets. Quiet by design. */
+function BranchButton({ label, onPress }: { label: string; onPress: () => void }) {
+  return (
+    <TouchableOpacity
+      className="flex-1 bg-white border border-slate-300 rounded-xl py-3 items-center"
+      onPress={onPress}
+    >
+      <Text className="text-slate-700 font-semibold text-sm">{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+/** Bottom sheet used by the branch actions. */
+function ActionSheet({
+  visible,
+  title,
+  subtitle,
+  onClose,
+  children,
+}: {
+  visible: boolean;
+  title: string;
+  subtitle?: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View className="flex-1 justify-end bg-black/50">
+        <View className="bg-white rounded-t-2xl" style={{ maxHeight: '85%' }}>
+          <View className="px-5 pt-5 pb-3">
+            <Text className="text-xl font-bold text-slate-900">{title}</Text>
+            {subtitle ? (
+              <Text className="text-sm text-slate-500 mt-0.5">{subtitle}</Text>
+            ) : null}
+          </View>
+          {/* flexShrink is required — RN defaults it to 0, which would push
+              the Close button outside the sheet's maxHeight. */}
+          <ScrollView className="px-5" style={{ flexShrink: 1 }}>
+            {children}
+          </ScrollView>
+          <TouchableOpacity
+            className="px-5 pt-3 pb-8 items-center border-t border-slate-200"
+            onPress={onClose}
+          >
+            <Text className="text-slate-500 font-semibold">Close</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/** Labelled group inside a sheet. */
+function SheetGroup({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <View className="mb-5">
+      <Text className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest mb-2">
+        {label}
+      </Text>
+      {children}
+    </View>
+  );
+}
+
+/**
+ * 3x3 strike zone from the catcher's view. Cells are numbered 1-9 left to
+ * right, top to bottom (1 = up-and-in to a RHB, 9 = down-and-away), matching
+ * the web scorer's `zoneLocation` encoding so both clients write the same
+ * shape. 0 means the pitch missed the zone.
+ */
+function StrikeZoneGrid({
+  selected,
+  onSelect,
+}: {
+  selected: number | null;
+  onSelect: (zone: number | null) => void;
+}) {
+  const rows = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9],
+  ];
+  return (
+    <View className="flex-row items-start gap-3">
+      <View className="border-2 border-gray-400 rounded-md overflow-hidden">
+        {rows.map((row) => (
+          <View key={row[0]} className="flex-row">
+            {row.map((zone) => {
+              const isSelected = selected === zone;
+              return (
+                <TouchableOpacity
+                  key={zone}
+                  accessibilityLabel={`Strike zone ${zone}`}
+                  className={`w-12 h-12 items-center justify-center border border-gray-300 ${
+                    isSelected ? 'bg-blue-600' : 'bg-white'
+                  }`}
+                  onPress={() => onSelect(isSelected ? null : zone)}
+                >
+                  <Text
+                    className={`text-xs font-semibold ${
+                      isSelected ? 'text-white' : 'text-gray-400'
+                    }`}
+                  >
+                    {zone}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        ))}
+      </View>
+      <TouchableOpacity
+        className={`rounded-lg px-3 py-2 border ${
+          selected === 0 ? 'bg-slate-800 border-slate-900' : 'bg-white border-gray-300'
+        }`}
+        onPress={() => onSelect(selected === 0 ? null : 0)}
+      >
+        <Text
+          className={`text-xs font-semibold ${
+            selected === 0 ? 'text-white' : 'text-gray-700'
+          }`}
+        >
+          Outside zone
+        </Text>
+      </TouchableOpacity>
+    </View>
   );
 }
 
@@ -1127,13 +1389,17 @@ function OutcomeButton({
   onPress: () => void;
   color: string;
 }) {
+  // The caller's colour is kept as a small accent rather than a full fill, so
+  // a sheet of a dozen options reads as one calm list instead of a paintbox
+  // while each option still keeps its identifying colour.
   return (
     <TouchableOpacity
-      className={`${color} rounded-xl px-5 py-3.5 flex-row items-center gap-2`}
+      className="bg-white border border-slate-300 rounded-xl px-4 py-3 flex-row items-center gap-2.5"
       onPress={onPress}
     >
-      <Text className="text-white text-base">{emoji}</Text>
-      <Text className="text-white font-semibold">{label}</Text>
+      <View className={`${color} w-2.5 h-2.5 rounded-full`} />
+      <Text className="text-slate-800 font-semibold">{label}</Text>
+      <Text className="text-slate-400 text-xs">{emoji}</Text>
     </TouchableOpacity>
   );
 }

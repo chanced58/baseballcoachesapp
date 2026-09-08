@@ -9,6 +9,8 @@ import { Channel } from './models/Channel';
 import { Message } from './models/Message';
 import { GameLineup } from './models/GameLineup';
 import { LeaguePlayer } from './models/LeaguePlayer';
+import { OpponentPlayer } from './models/OpponentPlayer';
+import { OpponentGameLineup } from './models/OpponentGameLineup';
 
 const adapter = new SQLiteAdapter({
   schema,
@@ -23,7 +25,7 @@ const adapter = new SQLiteAdapter({
 
 export const database = new Database({
   adapter,
-  modelClasses: [Game, GameEvent, Player, Channel, Message, GameLineup, LeaguePlayer],
+  modelClasses: [Game, GameEvent, Player, Channel, Message, GameLineup, LeaguePlayer, OpponentPlayer, OpponentGameLineup],
 });
 
-export { Game, GameEvent, Player, Channel, Message, GameLineup, LeaguePlayer };
+export { Game, GameEvent, Player, Channel, Message, GameLineup, LeaguePlayer, OpponentPlayer, OpponentGameLineup };

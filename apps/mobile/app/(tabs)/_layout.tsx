@@ -22,26 +22,32 @@ export default function TabLayout() {
         name="index"
         options={{ title: 'Home', tabBarIcon: () => null, tabBarLabel: 'Home' }}
       />
+      {/* The Games tab owns a nested Stack (games/_layout.tsx), so its
+          detail screens push properly. headerShown is off here because that
+          stack draws the header. */}
       <Tabs.Screen
-        name="games/index"
-        options={{ title: 'Games', tabBarLabel: 'Games' }}
-      />
-      <Tabs.Screen
-        name="schedule"
-        options={{ title: 'Schedule', tabBarLabel: 'Schedule' }}
-      />
-      <Tabs.Screen
-        name="practices/index"
-        options={{ title: 'Practices', tabBarLabel: 'Practices' }}
-      />
-      <Tabs.Screen
-        name="roster/index"
-        options={{ title: 'Roster', tabBarLabel: 'Roster' }}
+        name="games"
+        options={{ title: 'Games', tabBarLabel: 'Games', headerShown: false }}
       />
       <Tabs.Screen
         name="messages/index"
         options={{ title: 'Messages', tabBarLabel: 'Messages' }}
       />
+
+      {/* Reachable from cards on the Home screen, not from the tab bar
+          itself — kept out of the bar to keep it to the 3 primary
+          destinations (Home, Games, Messages). */}
+      <Tabs.Screen name="schedule" options={{ title: 'Schedule', href: null }} />
+      <Tabs.Screen name="practices/index" options={{ title: 'Practices', href: null }} />
+      <Tabs.Screen name="roster/index" options={{ title: 'Roster', href: null }} />
+
+      {/* Detail/dynamic routes nested under a tab — reachable via push
+          navigation, but hidden from the tab bar itself (href: null). The
+          games detail routes are not listed: they live inside the Games
+          stack. */}
+      <Tabs.Screen name="messages/[channelId]" options={{ href: null }} />
+      <Tabs.Screen name="practices/[practiceId]/card" options={{ href: null }} />
+      <Tabs.Screen name="practices/[practiceId]/attendance" options={{ href: null }} />
     </Tabs>
   );
 }

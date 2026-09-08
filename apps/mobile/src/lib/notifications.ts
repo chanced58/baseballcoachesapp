@@ -1,3 +1,4 @@
+import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
 import { router } from 'expo-router';
 import { Platform } from 'react-native';
@@ -38,7 +39,26 @@ export async function registerForPushNotifications(): Promise<void> {
     });
   }
 
-  const token = (await Notifications.getExpoPushTokenAsync()).data;
+  // Minting a push token requires an EAS project. Check before calling rather
+  // than catching after: calling without a projectId also logs a deprecation
+  // warning on every launch, which buries real warnings in the dev overlay.
+  // Local/dev-client builds aren't linked to an EAS project, so this simply
+  // skips registration until one is configured.
+  const projectId =
+    Constants.expoConfig?.extra?.eas?.projectId ??
+    Constants.easConfig?.projectId;
+  if (!projectId) {
+    console.log('Push registration skipped: no EAS projectId configured');
+    return;
+  }
+
+  let token: string;
+  try {
+    token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  } catch (err) {
+    console.warn('Push token request failed; skipping registration', err);
+    return;
+  }
 
   // Persist token to Supabase
   const supabase = getSupabaseClient();
